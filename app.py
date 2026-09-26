@@ -1,1435 +1,2046 @@
 import streamlit as st
-import streamlit.components.v1 as components
+import numpy as np
+import time
+import math
+import os
+import tempfile
+import threading
+from collections import deque
+
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+try:
+    import cv2
+    CV2_AVAILABLE = True
+except Exception:
+    CV2_AVAILABLE = False
+
+try:
+    import mediapipe as mp
+    MP_AVAILABLE = True
+except Exception:
+    MP_AVAILABLE = False
+
+try:
+    import imageio
+    IMAGEIO_AVAILABLE = True
+except Exception:
+    IMAGEIO_AVAILABLE = False
+
 
 st.set_page_config(
-    page_title="Advanced Storm Conductor",
-    page_icon="⛈️",
+    page_title="Continuous Finger-Motion Control",
+    page_icon="🖐️",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.markdown(
-    """
-    <style>
-    html, body {
-        background: #03060c;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
+if not CV2_AVAILABLE:
+    st.error("OpenCV is required for this application. Install dependencies from requirements.txt.")
+    st.stop()
+
+if CV2_AVAILABLE:
+    try:
+        cv2.setNumThreads(1)
+    except Exception:
+        pass
+
+
+# ============================================================
+# Constants
+# ============================================================
+
+FRAME_W, FRAME_H = 640, 480
+COMBINED_W = FRAME_W * 2
+
+FINGERS = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
+JOINT_SUFFIX = ["J1", "J2", "J3"]
+JOINT_LABELS = [f"{f} {j}" for f in FINGERS for j in JOINT_SUFFIX]
+
+FINGER_TIPS = [4, 8, 12, 16, 20]
+FINGER_MCP_INDICES = [1, 5, 9, 13, 17]
+
+FINGER_LANDMARK_CHAINS = [
+    (5, 6, 7, 8),
+    (9, 10, 11, 12),
+    (13, 14, 15, 16),
+    (17, 18, 19, 20),
+]
+
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (5, 9), (9, 10), (10, 11), (11, 12),
+    (9, 13), (13, 14), (14, 15), (15, 16),
+    (13, 17), (17, 18), (18, 19), (19, 20),
+    (0, 17),
+]
+
+ROBOT_MIN = np.zeros(15, dtype=float)
+ROBOT_MAX = np.array(
+    [
+        60, 70, 60,
+        90, 100, 80,
+        90, 100, 80,
+        90, 100, 80,
+        80, 90, 70,
+    ],
+    dtype=float,
 )
 
-APP_HTML = r"""
-<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8" />
-<style>
-    :root {
-        color-scheme: dark;
-    }
+THUMB_CMC = np.array([-0.34, 0.18, 0.02], dtype=float)
 
-    * {
-        box-sizing: border-box;
-    }
-
-    html, body {
-        margin: 0;
-        padding: 0;
-        width: 100%;
-        height: 100%;
-        overflow: hidden;
-        background: #03060c;
-        color: #f8fafc;
-        font-family: Arial, Helvetica, sans-serif;
-    }
-
-    #app {
-        position: relative;
-        width: 100%;
-        height: 100%;
-    }
-
-    canvas {
-        position: absolute;
-        inset: 0;
-        width: 100%;
-        height: 100%;
-        object-fit: contain;
-        background: #000;
-        touch-action: none;
-    }
-
-    #ui {
-        position: absolute;
-        top: 12px;
-        left: 12px;
-        z-index: 30;
-        display: flex;
-        flex-wrap: wrap;
-        gap: 8px;
-        align-items: center;
-        max-width: min(94vw, 1150px);
-        padding: 10px 12px;
-        border-radius: 16px;
-        background: rgba(2, 8, 20, 0.58);
-        border: 1px solid rgba(255, 255, 255, 0.12);
-        backdrop-filter: blur(10px);
-        box-shadow: 0 12px 34px rgba(0, 0, 0, 0.30);
-    }
-
-    button,
-    select,
-    input[type="range"] {
-        border: none;
-        outline: none;
-    }
-
-    button {
-        border-radius: 10px;
-        padding: 8px 11px;
-        background: rgba(148, 163, 184, 0.16);
-        color: #f8fafc;
-        cursor: pointer;
-        font-weight: 700;
-        font-size: 12px;
-        border: 1px solid rgba(255, 255, 255, 0.10);
-        transition: transform 0.12s ease, background 0.12s ease;
-    }
-
-    button:hover {
-        transform: translateY(-1px);
-        background: rgba(148, 163, 184, 0.24);
-    }
-
-    button.active {
-        background: rgba(34, 197, 94, 0.22);
-        border-color: rgba(34, 197, 94, 0.45);
-    }
-
-    button.rec {
-        background: rgba(185, 28, 28, 0.30);
-        border-color: rgba(248, 113, 113, 0.45);
-    }
-
-    label {
-        display: flex;
-        align-items: center;
-        gap: 6px;
-        font-size: 12px;
-        color: #dbeafe;
-        background: rgba(15, 23, 42, 0.35);
-        padding: 6px 8px;
-        border-radius: 10px;
-        border: 1px solid rgba(255, 255, 255, 0.08);
-    }
-
-    input[type="range"] {
-        width: 90px;
-        accent-color: #38bdf8;
-    }
-
-    input[type="checkbox"] {
-        accent-color: #38bdf8;
-        transform: scale(1.1);
-    }
-
-    #status {
-        position: absolute;
-        right: 12px;
-        bottom: 12px;
-        z-index: 30;
-        padding: 8px 10px;
-        border-radius: 10px;
-        font-size: 12px;
-        color: #e2e8f0;
-        background: rgba(2, 8, 20, 0.55);
-        border: 1px solid rgba(255, 255, 255, 0.10);
-        backdrop-filter: blur(8px);
-    }
-</style>
-</head>
-<body>
-<div id="app">
-    <canvas id="scene"></canvas>
-
-    <div id="ui">
-        <button id="autoBtn" class="active">Auto Demo: ON</button>
-        <button id="calibrateBtn">Recalibrate</button>
-        <button id="crescendoBtn">Crescendo</button>
-        <button id="calmBtn">Calm</button>
-        <button id="soundBtn">Sound: OFF</button>
-
-        <label>
-            Amplitude
-            <input id="ampRange" type="range" min="0" max="1" step="0.01" value="0.45" />
-        </label>
-
-        <label>
-            Speed
-            <input id="speedRange" type="range" min="0" max="2.5" step="0.01" value="1.0" />
-        </label>
-
-        <label>
-            Hold Arms High
-            <input id="raiseCheck" type="checkbox" />
-        </label>
-
-        <select id="recordLength">
-            <option value="5">5s</option>
-            <option value="10">10s</option>
-            <option value="20" selected>20s</option>
-            <option value="40">40s</option>
-            <option value="60">60s</option>
-            <option value="80">80s max</option>
-        </select>
-
-        <button id="recordBtn">Record Video</button>
-    </div>
-
-    <div id="status">Starting...</div>
-</div>
-
-<script>
-const W = 960;
-const H = 540;
-
-const canvas = document.getElementById('scene');
-const ctx = canvas.getContext('2d');
-canvas.width = W;
-canvas.height = H;
-
-const statusEl = document.getElementById('status');
-
-const autoBtn = document.getElementById('autoBtn');
-const calibrateBtn = document.getElementById('calibrateBtn');
-const crescendoBtn = document.getElementById('crescendoBtn');
-const calmBtn = document.getElementById('calmBtn');
-const soundBtn = document.getElementById('soundBtn');
-const ampRange = document.getElementById('ampRange');
-const speedRange = document.getElementById('speedRange');
-const raiseCheck = document.getElementById('raiseCheck');
-const recordBtn = document.getElementById('recordBtn');
-const recordLength = document.getElementById('recordLength');
-
-function clamp(v, a = 0, b = 1) {
-    return Math.max(a, Math.min(b, v));
+FINGER_MCP_POSITIONS = {
+    "Index": np.array([-0.22, 0.80, 0.00], dtype=float),
+    "Middle": np.array([0.00, 0.85, 0.00], dtype=float),
+    "Ring": np.array([0.22, 0.80, 0.00], dtype=float),
+    "Pinky": np.array([0.42, 0.72, 0.00], dtype=float),
 }
 
-function lerp(a, b, t) {
-    return a + (b - a) * t;
+FINGER_LENGTHS = {
+    "Thumb": np.array([0.20, 0.18, 0.15], dtype=float),
+    "Index": np.array([0.32, 0.22, 0.16], dtype=float),
+    "Middle": np.array([0.34, 0.24, 0.17], dtype=float),
+    "Ring": np.array([0.31, 0.22, 0.16], dtype=float),
+    "Pinky": np.array([0.26, 0.18, 0.14], dtype=float),
 }
 
-function smoothstep(e0, e1, x) {
-    if (e0 === e1) return x < e0 ? 0 : 1;
-    const t = clamp((x - e0) / (e1 - e0), 0, 1);
-    return t * t * (3 - 2 * t);
-}
+THUMB_INITIAL_DIR = np.array([0.45, 0.78, 0.25], dtype=float)
+THUMB_AXIS = np.array([0.88, -0.30, 0.15], dtype=float)
 
-function lerpColor(c1, c2, t) {
-    t = clamp(t);
-    return [
-        Math.round(lerp(c1[0], c2[0], t)),
-        Math.round(lerp(c1[1], c2[1], t)),
-        Math.round(lerp(c1[2], c2[2], t))
-    ];
-}
+FINGER_INITIAL_DIR = np.array([0.0, 1.0, 0.0], dtype=float)
+FINGER_AXIS = np.array([1.0, 0.0, 0.0], dtype=float)
 
-function rgba(c, a = 1) {
-    return `rgba(${c[0]},${c[1]},${c[2]},${a})`;
-}
 
-function roundRect(x, y, w, h, r) {
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.arcTo(x + w, y, x + w, y + h, r);
-    ctx.arcTo(x + w, y + h, x, y + h, r);
-    ctx.arcTo(x, y + h, x, y, r);
-    ctx.arcTo(x, y, x + w, y, r);
-    ctx.closePath();
-}
+# ============================================================
+# Utilities
+# ============================================================
 
-const BAND_NAMES = [
-    'Light overcast',
-    'Rain',
-    'Wind-bent rain + dark sky',
-    'Lightning + thunder'
-];
+def rerun_app():
+    try:
+        st.rerun()
+    except Exception:
+        st.experimental_rerun()
 
-const state = {
-    t: 0,
-    last: performance.now() / 1000,
-    fps: 60,
 
-    auto: true,
-    calibrated: false,
-    calibT: 0,
-    calibDur: 2.0,
-    calibSamples: [],
-    neutralWristRelPx: H * 0.205,
+def normalize_vec(v, fallback=None):
+    v = np.asarray(v, dtype=float)
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        if fallback is None:
+            return np.array([0.0, 1.0, 0.0], dtype=float)
+        return np.asarray(fallback, dtype=float)
+    return v / n
 
-    intensity: 0,
-    raw: 0,
-    band: 0,
-    bandCandidate: 0,
-    bandCandidateT: 0,
 
-    crescendoUntil: -1,
-    lastCrescendo: -10,
-    raiseHold: 0,
+def rotate_vec(v, axis, angle):
+    v = np.asarray(v, dtype=float)
+    axis = normalize_vec(axis)
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1.0 - c)
 
-    wind: 0,
 
-    flash: {
-        start: -10,
-        duration: 0.15,
-        bolt: null,
-        distance: 0
-    },
-    flashEvents: [],
-    thunderEvents: [],
-    lastFlashInfo: null,
-    lastThunderInfo: null,
+def angle_between(v1, v2):
+    v1 = np.asarray(v1, dtype=float)
+    v2 = np.asarray(v2, dtype=float)
+    n1 = np.linalg.norm(v1)
+    n2 = np.linalg.norm(v2)
 
-    drops: [],
-    splashes: [],
-    clouds: [],
+    if n1 < 1e-9 or n2 < 1e-9:
+        return 0.0
 
-    trailL: [],
-    trailR: [],
+    cos_val = np.dot(v1, v2) / (n1 * n2)
+    cos_val = float(np.clip(cos_val, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cos_val)))
 
-    wristHistory: [],
-    pointerHistory: [],
 
-    manualAmp: 0.45,
-    manualSpeed: 1.0,
-    manualRaise: false,
+def low_pass(prev, raw, dt, tau):
+    prev = np.asarray(prev, dtype=float)
+    raw = np.asarray(raw, dtype=float)
 
-    soundOn: false,
+    if tau <= 1e-4:
+        return raw.copy()
 
-    recording: false,
-    recordStopAt: 0,
-    chunks: []
-};
+    alpha = 1.0 - math.exp(-float(dt) / max(float(tau), 1e-4))
+    return prev + alpha * (raw - prev)
 
-let recorder = null;
-let audioCtx = null;
-let masterGain = null;
-let noiseBuffer = null;
 
-function makeCloudSprite(w, h, alpha) {
-    const c = document.createElement('canvas');
-    c.width = w;
-    c.height = h;
-    const g = c.getContext('2d');
+def rate_limit(prev, target, max_rate, dt):
+    prev = np.asarray(prev, dtype=float)
+    target = np.asarray(target, dtype=float)
+    max_delta = float(max_rate) * float(dt)
+    delta = np.clip(target - prev, -max_delta, max_delta)
+    return prev + delta
 
-    const grad = g.createRadialGradient(w / 2, h / 2, 8, w / 2, h / 2, w / 2);
-    grad.addColorStop(0, `rgba(255,255,255,${alpha})`);
-    grad.addColorStop(1, 'rgba(255,255,255,0)');
 
-    g.fillStyle = grad;
-    g.beginPath();
-    g.ellipse(w / 2, h / 2, w / 2, h / 2, 0, 0, Math.PI * 2);
-    g.fill();
+def wrap_angle(a):
+    return math.atan2(math.sin(a), math.cos(a))
 
-    return c;
-}
 
-const cloudSprites = [
-    makeCloudSprite(260, 95, 0.72),
-    makeCloudSprite(190, 75, 0.64),
-    makeCloudSprite(330, 125, 0.54)
-];
+# ============================================================
+# Hand normalization, joint extraction, forward kinematics
+# ============================================================
 
-function initClouds() {
-    state.clouds = [];
-    for (let i = 0; i < 18; i++) {
-        state.clouds.push({
-            sprite: cloudSprites[i % cloudSprites.length],
-            x: Math.random() * W,
-            y: 18 + Math.random() * 180,
-            scale: 0.45 + Math.random() * 1.35,
-            speed: 3 + Math.random() * 17,
-            alpha: 0.45 + Math.random() * 0.45
-        });
+def normalize_landmarks(pts):
+    pts = np.asarray(pts, dtype=float).copy()
+    pts = np.nan_to_num(pts, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if pts.shape != (21, 3):
+        return pts
+
+    wrist = pts[0].copy()
+    pts -= wrist
+
+    palm_len = np.linalg.norm(pts[9])
+    if palm_len < 1e-6:
+        palm_len = 1.0
+
+    pts /= palm_len
+
+    y_axis = normalize_vec(pts[9], fallback=[0.0, 1.0, 0.0])
+
+    x_raw = pts[17] - pts[5]
+    x_axis = normalize_vec(x_raw, fallback=[1.0, 0.0, 0.0])
+    x_axis = x_axis - np.dot(x_axis, y_axis) * y_axis
+    x_axis = normalize_vec(x_axis, fallback=[1.0, 0.0, 0.0])
+
+    z_axis = np.cross(x_axis, y_axis)
+    if np.linalg.norm(z_axis) < 1e-6:
+        z_axis = np.array([0.0, 0.0, 1.0], dtype=float)
+
+    z_axis = normalize_vec(z_axis)
+    y_axis = normalize_vec(np.cross(z_axis, x_axis))
+
+    R = np.column_stack((x_axis, y_axis, z_axis))
+
+    if np.linalg.det(R) < 0:
+        R[:, 2] *= -1.0
+
+    normalized = pts @ R
+    return np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def extract_joint_angles(pts):
+    pts = np.asarray(pts, dtype=float)
+    pts = np.nan_to_num(pts, nan=0.0, posinf=0.0, neginf=0.0)
+
+    angles = np.zeros(15, dtype=float)
+
+    if pts.shape != (21, 3):
+        return angles
+
+    palm_dir = normalize_vec(pts[9] - pts[0], fallback=[0.0, 1.0, 0.0])
+
+    v0 = normalize_vec(pts[1] - pts[0], fallback=[0.0, 1.0, 0.0])
+    v1 = normalize_vec(pts[2] - pts[1], fallback=[0.0, 1.0, 0.0])
+    v2 = normalize_vec(pts[3] - pts[2], fallback=[0.0, 1.0, 0.0])
+    v3 = normalize_vec(pts[4] - pts[3], fallback=[0.0, 1.0, 0.0])
+
+    angles[0] = angle_between(v0, v1)
+    angles[1] = angle_between(v1, v2)
+    angles[2] = angle_between(v2, v3)
+
+    for k, (mcp, pip, dip, tip) in enumerate(FINGER_LANDMARK_CHAINS, start=1):
+        u1 = normalize_vec(pts[pip] - pts[mcp], fallback=[0.0, 1.0, 0.0])
+        u2 = normalize_vec(pts[dip] - pts[pip], fallback=[0.0, 1.0, 0.0])
+        u3 = normalize_vec(pts[tip] - pts[dip], fallback=[0.0, 1.0, 0.0])
+
+        angles[3 * k + 0] = angle_between(palm_dir, u1)
+        angles[3 * k + 1] = angle_between(u1, u2)
+        angles[3 * k + 2] = angle_between(u2, u3)
+
+    return np.clip(np.nan_to_num(angles, nan=0.0, posinf=0.0, neginf=0.0), 0.0, 180.0)
+
+
+def forward_chain(start, direction, axis, lengths, angles_deg):
+    pts = []
+    current = np.asarray(start, dtype=float).copy()
+    dir_vec = normalize_vec(direction)
+    axis_vec = normalize_vec(axis)
+
+    for length, ang in zip(lengths, angles_deg):
+        ang_rad = math.radians(float(ang))
+        dir_vec = normalize_vec(rotate_vec(dir_vec, axis_vec, ang_rad))
+        current = current + dir_vec * float(length)
+        pts.append(current.copy())
+
+    return np.array(pts, dtype=float)
+
+
+def build_hand_from_angles(angles):
+    angles = np.asarray(angles, dtype=float)
+    angles = np.nan_to_num(angles, nan=0.0, posinf=0.0, neginf=0.0)
+
+    pts = np.zeros((21, 3), dtype=float)
+    pts[0] = np.zeros(3, dtype=float)
+
+    pts[1] = THUMB_CMC
+    thumb_chain = forward_chain(
+        pts[1],
+        THUMB_INITIAL_DIR,
+        THUMB_AXIS,
+        FINGER_LENGTHS["Thumb"],
+        angles[0:3],
+    )
+    pts[2:5] = thumb_chain
+
+    finger_names = ["Index", "Middle", "Ring", "Pinky"]
+    mcp_indices = [5, 9, 13, 17]
+
+    for i, name in enumerate(finger_names):
+        mcp_pos = FINGER_MCP_POSITIONS[name]
+        pts[mcp_indices[i]] = mcp_pos
+
+        chain = forward_chain(
+            mcp_pos,
+            FINGER_INITIAL_DIR,
+            FINGER_AXIS,
+            FINGER_LENGTHS[name],
+            angles[3 * (i + 1): 3 * (i + 2)],
+        )
+
+        pts[mcp_indices[i] + 1: mcp_indices[i] + 4] = chain
+
+    return pts
+
+
+NOMINAL_PALM_LENGTH = float(np.linalg.norm(build_hand_from_angles(np.zeros(15))[9]))
+if NOMINAL_PALM_LENGTH < 1e-6:
+    NOMINAL_PALM_LENGTH = 1.0
+
+
+# ============================================================
+# Synthetic demo generator
+# ============================================================
+
+def synthetic_joint_angles(t, preset):
+    angles = np.zeros(15, dtype=float)
+    t = float(t)
+
+    def osc(freq, phase=0.0):
+        return 0.5 + 0.5 * np.sin(freq * t + phase)
+
+    if preset == "Open":
+        angles[:] = 3.0
+        return angles
+
+    if preset == "Fist":
+        angles[0:3] = [35.0, 55.0, 45.0]
+        for f in range(1, 5):
+            angles[3 * f: 3 * f + 3] = [55.0, 95.0, 75.0]
+        return angles
+
+    if preset == "Natural":
+        for f in range(5):
+            base = 15.0 + 50.0 * osc(0.8, f * 0.8)
+            if f == 0:
+                base *= 0.60
+
+            angles[3 * f + 0] = 0.45 * base + 5.0 * np.sin(0.4 * t + f)
+            angles[3 * f + 1] = base
+            angles[3 * f + 2] = 0.65 * base + 4.0 * np.sin(0.6 * t + f)
+
+    elif preset == "Grasp":
+        g = 20.0 + 80.0 * osc(1.2, 0.0)
+        angles[0:3] = [0.45 * g, 0.70 * g, 0.55 * g]
+
+        for f in range(1, 5):
+            angles[3 * f + 0] = 0.50 * g
+            angles[3 * f + 1] = g
+            angles[3 * f + 2] = 0.80 * g
+
+    elif preset == "Point":
+        index = 8.0 + 6.0 * osc(1.5, 0.0)
+        angles[3:6] = [0.35 * index, index, 0.45 * index]
+
+        thumb = 25.0 + 10.0 * osc(0.9, 0.7)
+        angles[0:3] = [0.50 * thumb, thumb, 0.65 * thumb]
+
+        for f in [2, 3, 4]:
+            bend = 75.0 + 15.0 * osc(0.9, f * 0.5)
+            angles[3 * f + 0] = 0.45 * bend
+            angles[3 * f + 1] = bend
+            angles[3 * f + 2] = 0.70 * bend
+
+    elif preset == "Pinch":
+        pinch = 30.0 + 30.0 * osc(1.3, 0.0)
+        angles[0:3] = [0.55 * pinch, pinch, 0.75 * pinch]
+        angles[3:6] = [0.40 * pinch, pinch, 0.55 * pinch]
+
+        for f in [2, 3, 4]:
+            small = 10.0 + 5.0 * osc(0.8, f)
+            angles[3 * f: 3 * f + 3] = [0.4 * small, small, 0.5 * small]
+
+    elif preset == "Wave":
+        for f in range(5):
+            a = 15.0 + 70.0 * osc(1.6, -f * 0.7)
+            if f == 0:
+                a *= 0.55
+
+            angles[3 * f + 0] = 0.40 * a
+            angles[3 * f + 1] = a
+            angles[3 * f + 2] = 0.70 * a
+
+    else:
+        for f in range(5):
+            a = 20.0 + 45.0 * osc(0.9, f * 0.6)
+            angles[3 * f: 3 * f + 3] = [0.45 * a, a, 0.70 * a]
+
+    return np.clip(angles, 0.0, 120.0)
+
+
+def synthetic_landmarks(t, preset, noise=0.0):
+    angles = synthetic_joint_angles(t, preset)
+    pts = build_hand_from_angles(angles)
+    pts = normalize_landmarks(pts)
+
+    if noise is not None and noise > 1e-6:
+        pts += np.random.normal(0.0, float(noise) * 0.006, pts.shape)
+
+    return np.nan_to_num(pts, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# ============================================================
+# Threaded webcam capture and smoothing
+# ============================================================
+
+class WebcamReader:
+    def __init__(self, index=0):
+        self.index = index
+        self.cap = None
+        self.lock = threading.Lock()
+        self.frame = None
+        self.running = False
+        self.failed = False
+        self.thread = None
+
+    def open(self):
+        try:
+            self.cap = cv2.VideoCapture(self.index)
+
+            if not self.cap.isOpened():
+                self.failed = True
+                return False
+
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+
+            try:
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+
+            try:
+                self.cap.set(cv2.CAP_PROP_FPS, 30)
+            except Exception:
+                pass
+
+            return True
+
+        except Exception:
+            self.failed = True
+            return False
+
+    def _loop(self):
+        while self.running and self.cap is not None and self.cap.isOpened():
+            try:
+                ret, frame = self.cap.read()
+            except Exception:
+                ret = False
+                frame = None
+
+            if ret and frame is not None:
+                with self.lock:
+                    self.frame = frame
+            else:
+                time.sleep(0.005)
+
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except Exception:
+            pass
+
+    def start(self):
+        if self.running or self.failed:
+            return
+
+        if not self.open():
+            return
+
+        self.running = True
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def latest(self):
+        with self.lock:
+            if self.frame is None:
+                return None
+            return self.frame.copy()
+
+    def stop(self):
+        self.running = False
+
+
+class ArrayEMA:
+    def __init__(self):
+        self.prev = None
+
+    def reset(self):
+        self.prev = None
+
+    def __call__(self, x, dt, tau):
+        x = np.asarray(x, dtype=float)
+
+        if self.prev is None:
+            self.prev = x.copy()
+            return x.copy()
+
+        tau = max(float(tau), 1e-4)
+        alpha = 1.0 - math.exp(-float(dt) / tau)
+
+        self.prev = self.prev + alpha * (x - self.prev)
+        return self.prev.copy()
+
+
+def stop_camera_reader():
+    reader = st.session_state.get("cam_reader")
+
+    if reader is not None:
+        try:
+            reader.stop()
+        except Exception:
+            pass
+
+    st.session_state.cam_reader = None
+    st.session_state.camera_failed = False
+
+
+def get_camera_reader():
+    if not CV2_AVAILABLE:
+        return None
+
+    if st.session_state.get("camera_failed", False):
+        return None
+
+    if "cam_reader" not in st.session_state or st.session_state.cam_reader is None:
+        reader = WebcamReader(0)
+        reader.start()
+
+        if reader.failed:
+            st.session_state.camera_failed = True
+            return None
+
+        st.session_state.cam_reader = reader
+
+    return st.session_state.cam_reader
+
+
+def get_mp_hands():
+    if not MP_AVAILABLE:
+        return None
+
+    if "mp_hands" not in st.session_state:
+        try:
+            st.session_state.mp_hands = mp.solutions.hands.Hands(
+                max_num_hands=1,
+                model_complexity=0,
+                min_detection_confidence=0.7,
+                min_tracking_confidence=0.7,
+            )
+        except Exception:
+            st.session_state.mp_hands = None
+
+    return st.session_state.mp_hands
+
+
+def get_webcam_pose(cfg=None):
+    cfg = cfg or {}
+
+    if not CV2_AVAILABLE:
+        return None, None, "OpenCV unavailable"
+
+    reader = get_camera_reader()
+
+    if reader is None:
+        return None, None, "Camera unavailable"
+
+    frame = reader.latest()
+
+    if frame is None:
+        return None, None, "Camera warming up"
+
+    frame = cv2.resize(frame, (FRAME_W, FRAME_H))
+
+    if MP_AVAILABLE:
+        try:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            hands = get_mp_hands()
+
+            if hands is not None:
+                results = hands.process(rgb)
+
+                if results.multi_hand_landmarks:
+                    hand = results.multi_hand_landmarks[0]
+
+                    raw_img = np.array(
+                        [[lm.x, lm.y, lm.z] for lm in hand.landmark],
+                        dtype=float,
+                    )
+
+                    raw_img = np.nan_to_num(raw_img, nan=0.0, posinf=0.0, neginf=0.0)
+
+                    now = time.time()
+                    dt_img = now - st.session_state.get("last_img_landmark_time", now - 0.033)
+                    dt_img = float(np.clip(dt_img, 0.005, 0.20))
+                    st.session_state.last_img_landmark_time = now
+
+                    if "img_smoother" not in st.session_state:
+                        st.session_state.img_smoother = ArrayEMA()
+
+                    camera_tau = float(cfg.get("camera_tau", 0.18))
+
+                    smoothed_img = st.session_state.img_smoother(
+                        raw_img,
+                        dt_img,
+                        camera_tau,
+                    )
+
+                    smoothed_img = np.clip(smoothed_img, -0.2, 1.2)
+
+                    h, w = frame.shape[:2]
+
+                    for a, b in HAND_CONNECTIONS:
+                        pa = smoothed_img[a]
+                        pb = smoothed_img[b]
+
+                        if (
+                            0.0 <= pa[0] <= 1.0
+                            and 0.0 <= pa[1] <= 1.0
+                            and 0.0 <= pb[0] <= 1.0
+                            and 0.0 <= pb[1] <= 1.0
+                        ):
+                            p1 = (int(pa[0] * w), int(pa[1] * h))
+                            p2 = (int(pb[0] * w), int(pb[1] * h))
+
+                            cv2.line(frame, p1, p2, (0, 220, 120), 2, cv2.LINE_AA)
+
+                    for p in smoothed_img:
+                        if 0.0 <= p[0] <= 1.0 and 0.0 <= p[1] <= 1.0:
+                            cv2.circle(
+                                frame,
+                                (int(p[0] * w), int(p[1] * h)),
+                                3,
+                                (0, 180, 255),
+                                -1,
+                                cv2.LINE_AA,
+                            )
+
+                    pts = np.column_stack(
+                        (
+                            smoothed_img[:, 0] - 0.5,
+                            0.5 - smoothed_img[:, 1],
+                            -2.0 * smoothed_img[:, 2],
+                        )
+                    )
+
+                    if results.multi_handedness:
+                        try:
+                            label = results.multi_handedness[0].classification[0].label
+                            if str(label).lower() == "left":
+                                pts[:, 0] *= -1.0
+                        except Exception:
+                            pass
+
+                    pts = normalize_landmarks(pts)
+                    return frame, pts, "Webcam smoothed"
+
+                else:
+                    if "img_smoother" in st.session_state:
+                        st.session_state.img_smoother.reset()
+
+                    st.session_state.last_img_landmark_time = time.time()
+
+        except Exception:
+            pass
+
+    return frame, None, "Webcam no landmarks"
+
+
+def get_current_pose(cfg):
+    source = cfg.get("source", "Synthetic demo")
+    preset = cfg.get("preset", "Natural")
+    noise = cfg.get("noise", 0.0)
+
+    if source.startswith("Webcam"):
+        frame, pts, msg = get_webcam_pose(cfg)
+
+        if pts is not None:
+            return frame, pts, msg, "webcam"
+
+        fallback_pts = synthetic_landmarks(
+            st.session_state.sim_time,
+            preset,
+            noise,
+        )
+
+        return frame, fallback_pts, msg + " -> synthetic fallback", "synthetic"
+
+    stop_camera_reader()
+
+    pts = synthetic_landmarks(
+        st.session_state.sim_time,
+        preset,
+        noise,
+    )
+
+    return None, pts, "Synthetic demo", "synthetic"
+
+
+# ============================================================
+# Drawing and visualization
+# ============================================================
+
+def project_point(p, view, w, h):
+    p = np.asarray(p, dtype=float)
+    cx = int(w * 0.5)
+    cy = int(h * 0.55)
+    scale = 170
+
+    if not np.all(np.isfinite(p)):
+        return cx, cy
+
+    if view == "sagittal":
+        u = cx + int((p[2] + 0.15 * p[0]) * scale)
+        v = cy - int(p[1] * scale)
+    else:
+        u = cx + int((p[0] + 0.35 * p[2]) * scale)
+        v = cy - int((p[1] - 0.15 * p[2]) * scale)
+
+    return int(u), int(v)
+
+
+def draw_skeleton(img, pts, color, view="pseudo"):
+    if pts is None:
+        return
+
+    pts = np.asarray(pts, dtype=float)
+
+    if pts.shape != (21, 3):
+        return
+
+    h, w = img.shape[:2]
+    proj = [project_point(p, view, w, h) for p in pts]
+
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(img, proj[a], proj[b], (170, 170, 180), 2, cv2.LINE_AA)
+
+    for p in proj:
+        cv2.circle(img, p, 3, color, -1, cv2.LINE_AA)
+
+
+def put_hud(img, lines, estop=False):
+    y = 26
+
+    for line in lines:
+        cv2.putText(
+            img,
+            str(line),
+            (12, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (235, 235, 235),
+            1,
+            cv2.LINE_AA,
+        )
+        y += 22
+
+    if estop:
+        cv2.rectangle(img, (0, 0), (img.shape[1] - 1, img.shape[0] - 1), (0, 0, 220), 8)
+        cv2.putText(
+            img,
+            "EMERGENCY STOP ACTIVE",
+            (12, img.shape[0] - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (80, 80, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def make_scene_frame(human_pts, robot_pts, left_image=None, info=None):
+    info = info or {}
+
+    left = np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
+    left[:] = (25, 28, 35)
+
+    if left_image is not None:
+        left = cv2.resize(left_image, (FRAME_W, FRAME_H))
+    else:
+        draw_skeleton(left, human_pts, color=(80, 220, 120), view="pseudo")
+        cv2.putText(
+            left,
+            "Human hand normalized",
+            (12, FRAME_H - 16),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (200, 220, 200),
+            1,
+            cv2.LINE_AA,
+        )
+
+    right = np.zeros((FRAME_H, FRAME_W, 3), dtype=np.uint8)
+    right[:] = (20, 22, 30)
+
+    draw_skeleton(right, robot_pts, color=(255, 180, 0), view="sagittal")
+
+    cv2.putText(
+        right,
+        "Robot hand simulation",
+        (12, FRAME_H - 16),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (210, 210, 220),
+        1,
+        cv2.LINE_AA,
+    )
+
+    combined = np.hstack([left, right])
+
+    hud_lines = [
+        f"Source: {info.get('source', 'N/A')}",
+        f"Mode: {info.get('control_mode', 'N/A')}",
+        f"t={info.get('elapsed', 0.0):.1f}/{info.get('duration', 0.0):.0f}s  FPS={info.get('fps', 0.0):.0f}",
+        f"Latency={info.get('latency', 0.0):.0f} ms  Error={info.get('error', 0.0):.1f} deg",
+        str(info.get("message", "")),
+    ]
+
+    put_hud(combined, hud_lines, estop=bool(info.get("estop", False)))
+
+    return combined
+
+
+# ============================================================
+# Video recorder
+# ============================================================
+
+class VideoRecorder:
+    def __init__(self, fps, size):
+        self.fps = int(fps)
+        self.size = size
+        self.ok = False
+        self.backend = None
+        self.path = None
+        self.writer = None
+        self._init_writer()
+
+    def _init_writer(self):
+        stamp = int(time.time())
+        tmpdir = tempfile.gettempdir()
+
+        if CV2_AVAILABLE:
+            candidates = [
+                ("mp4v", ".mp4"),
+                ("avc1", ".mp4"),
+                ("XVID", ".avi"),
+                ("MJPG", ".avi"),
+            ]
+
+            for fourcc_str, ext in candidates:
+                path = os.path.join(tmpdir, f"fingerbot_demo_{stamp}{ext}")
+
+                try:
+                    fourcc = cv2.VideoWriter_fourcc(*fourcc_str)
+                    writer = cv2.VideoWriter(path, fourcc, self.fps, self.size)
+
+                    if writer.isOpened():
+                        self.writer = writer
+                        self.path = path
+                        self.backend = "cv2"
+                        self.ok = True
+                        return
+
+                except Exception:
+                    pass
+
+        if IMAGEIO_AVAILABLE:
+            path = os.path.join(tmpdir, f"fingerbot_demo_{stamp}.mp4")
+
+            try:
+                self.writer = imageio.get_writer(
+                    path,
+                    fps=self.fps,
+                    codec="libx264",
+                    quality=8,
+                    macro_block_size=1,
+                )
+                self.path = path
+                self.backend = "imageio"
+                self.ok = True
+                return
+
+            except Exception:
+                try:
+                    self.writer = imageio.get_writer(path, fps=self.fps)
+                    self.path = path
+                    self.backend = "imageio"
+                    self.ok = True
+                    return
+                except Exception:
+                    pass
+
+    def write(self, frame_bgr):
+        if not self.ok:
+            return
+
+        if self.backend == "cv2":
+            self.writer.write(frame_bgr)
+        elif self.backend == "imageio":
+            rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            self.writer.append_data(rgb)
+
+    def release(self):
+        if not self.ok:
+            return
+
+        try:
+            if self.backend == "cv2":
+                self.writer.release()
+            else:
+                self.writer.close()
+        except Exception:
+            pass
+
+        self.ok = False
+
+
+# ============================================================
+# Hardware abstraction layer
+# ============================================================
+
+class ServoHAL:
+    def __init__(self, min_arr, max_arr, max_rate):
+        self.min = np.asarray(min_arr, dtype=float).copy()
+        self.max = np.asarray(max_arr, dtype=float).copy()
+        self.max_rate = float(max_rate)
+
+        self.command = np.zeros_like(self.min)
+        self.actual = np.zeros_like(self.min)
+
+        self.enabled = True
+        self.saturation_events = 0
+
+    def reset(self):
+        self.command = np.zeros_like(self.min)
+        self.actual = np.zeros_like(self.min)
+        self.enabled = True
+        self.saturation_events = 0
+
+    def update(self, raw_targets, dt, estop=False, max_rate_override=None):
+        raw_targets = np.asarray(raw_targets, dtype=float)
+        raw_targets = np.nan_to_num(raw_targets, nan=0.0, posinf=0.0, neginf=0.0)
+
+        max_rate = float(max_rate_override if max_rate_override is not None else self.max_rate)
+
+        if estop:
+            self.enabled = False
+            self.command = self.actual.copy()
+            return self.actual.copy(), True, self.saturation_events
+
+        self.enabled = True
+
+        clipped = np.clip(raw_targets, self.min, self.max)
+
+        if not np.allclose(clipped, raw_targets):
+            self.saturation_events += int(np.sum(~np.isclose(clipped, raw_targets)))
+
+        self.command = rate_limit(self.command, clipped, max_rate, dt)
+
+        tau = 0.05
+        alpha = min(1.0, float(dt) / tau)
+        self.actual = self.actual + alpha * (self.command - self.actual)
+
+        self.actual = np.clip(self.actual, self.min, self.max)
+
+        return self.actual.copy(), False, self.saturation_events
+
+
+# ============================================================
+# Mapping, IK, constraints
+# ============================================================
+
+def map_human_to_robot(human_angles, calib_min, calib_max, robot_min, robot_max):
+    human_angles = np.asarray(human_angles, dtype=float)
+    calib_min = np.asarray(calib_min, dtype=float)
+    calib_max = np.asarray(calib_max, dtype=float)
+
+    span = np.maximum(calib_max - calib_min, 1e-3)
+    normalized = np.clip((human_angles - calib_min) / span, 0.0, 1.0)
+
+    robot_min = np.asarray(robot_min, dtype=float)
+    robot_max = np.asarray(robot_max, dtype=float)
+
+    return robot_min + normalized * (robot_max - robot_min)
+
+
+def fk2_from_relative(rel_angles, lengths):
+    abs_angles = np.cumsum(rel_angles)
+    pos = np.zeros(2, dtype=float)
+    points = [pos.copy()]
+
+    for length, ang in zip(lengths, abs_angles):
+        pos = pos + length * np.array([math.cos(ang), math.sin(ang)], dtype=float)
+        points.append(pos.copy())
+
+    return points[-1], points
+
+
+def ik_3link(target, lengths, limits, init, iterations=18, learning_rate=0.7):
+    target = np.asarray(target, dtype=float)
+    target = np.nan_to_num(target, nan=0.0, posinf=0.0, neginf=0.0)
+
+    lengths = np.asarray(lengths, dtype=float)
+    limits = np.asarray(limits, dtype=float)
+
+    rel = np.asarray(init, dtype=float).copy()
+    rel = np.nan_to_num(rel, nan=0.0, posinf=0.0, neginf=0.0)
+    rel = np.clip(rel, limits[:, 0], limits[:, 1])
+
+    for _ in range(iterations):
+        ee, _ = fk2_from_relative(rel, lengths)
+
+        if np.linalg.norm(ee - target) < 1e-4:
+            break
+
+        for i in range(len(lengths) - 1, -1, -1):
+            ee, points = fk2_from_relative(rel, lengths)
+            joint = points[i]
+
+            v_current = ee - joint
+            v_target = target - joint
+
+            n1 = np.linalg.norm(v_current)
+            n2 = np.linalg.norm(v_target)
+
+            if n1 < 1e-6 or n2 < 1e-6:
+                continue
+
+            ang_current = math.atan2(v_current[1], v_current[0])
+            ang_target = math.atan2(v_target[1], v_target[0])
+            delta = wrap_angle(ang_target - ang_current)
+
+            rel[i] += learning_rate * delta
+            rel[i] = float(np.clip(rel[i], limits[i, 0], limits[i, 1]))
+
+    return np.clip(rel, limits[:, 0], limits[:, 1])
+
+
+def ik_targets_from_landmarks(norm_lm, direct_targets):
+    targets = np.asarray(direct_targets, dtype=float).copy()
+
+    if norm_lm is None:
+        return targets
+
+    norm_lm = np.asarray(norm_lm, dtype=float)
+    norm_lm = np.nan_to_num(norm_lm, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if norm_lm.shape != (21, 3):
+        return targets
+
+    for f, name in enumerate(FINGERS):
+        mcp_idx = FINGER_MCP_INDICES[f]
+        tip_idx = FINGER_TIPS[f]
+
+        vec = norm_lm[tip_idx] - norm_lm[mcp_idx]
+
+        y = float(np.dot(vec, np.array([0.0, 1.0, 0.0])))
+        z = float(np.dot(vec, np.array([0.0, 0.0, 1.0])))
+
+        y = max(0.05, y)
+        z = max(0.0, z)
+
+        target = np.array([y, z], dtype=float)
+
+        lengths = FINGER_LENGTHS[name] / NOMINAL_PALM_LENGTH
+        max_reach = float(np.sum(lengths)) * 0.98
+        min_reach = float(np.sum(lengths)) * 0.12
+
+        r = float(np.linalg.norm(target))
+
+        if r > max_reach and r > 1e-9:
+            target *= max_reach / r
+        elif r < min_reach and r > 1e-9:
+            target *= min_reach / r
+        else:
+            target = np.array([min_reach, 0.0], dtype=float)
+
+        limits = np.deg2rad(
+            np.column_stack(
+                (
+                    ROBOT_MIN[3 * f: 3 * f + 3],
+                    ROBOT_MAX[3 * f: 3 * f + 3],
+                )
+            )
+        )
+
+        init = np.deg2rad(targets[3 * f: 3 * f + 3])
+        solved = ik_3link(target, lengths, limits, init)
+
+        targets[3 * f: 3 * f + 3] = np.rad2deg(solved)
+
+    return np.clip(targets, ROBOT_MIN, ROBOT_MAX)
+
+
+def apply_collision_constraints(targets, enabled=True):
+    targets = np.asarray(targets, dtype=float).copy()
+    targets = np.nan_to_num(targets, nan=0.0, posinf=0.0, neginf=0.0)
+    targets = np.clip(targets, ROBOT_MIN, ROBOT_MAX)
+
+    if not enabled:
+        return targets
+
+    for _ in range(5):
+        pts = build_hand_from_angles(targets)
+        collision = False
+
+        for f, tip_idx in enumerate(FINGER_TIPS):
+            ref = pts[0] if f == 0 else pts[9]
+            dist = float(np.linalg.norm(pts[tip_idx] - ref))
+            min_dist = 0.09 if f == 0 else 0.11
+
+            if dist < min_dist:
+                targets[3 * f: 3 * f + 3] *= 0.90
+                targets[3 * f: 3 * f + 3] = np.maximum(
+                    targets[3 * f: 3 * f + 3],
+                    ROBOT_MIN[3 * f: 3 * f + 3],
+                )
+                collision = True
+
+        if not collision:
+            break
+
+    return np.clip(targets, ROBOT_MIN, ROBOT_MAX)
+
+
+# ============================================================
+# Session state
+# ============================================================
+
+if "app_initialized" not in st.session_state:
+    st.session_state.app_initialized = True
+
+    st.session_state.running = False
+    st.session_state.estop = False
+
+    st.session_state.fps = 10
+    st.session_state.run_duration = 15.0
+    st.session_state.record_enabled = True
+
+    st.session_state.run_start_time = time.time()
+    st.session_state.elapsed = 0.0
+    st.session_state.frame_count = 0
+    st.session_state.sim_time = 0.0
+    st.session_state.last_tick = time.time()
+
+    st.session_state.recorder = None
+    st.session_state.recorder_failed = False
+
+    st.session_state.video_path = None
+    st.session_state.video_bytes = None
+    st.session_state.video_ready = False
+
+    st.session_state.hal = ServoHAL(ROBOT_MIN, ROBOT_MAX, 120.0)
+
+    st.session_state.robot_actual = np.zeros(15, dtype=float)
+    st.session_state.robot_cmd = np.zeros(15, dtype=float)
+
+    st.session_state.human_raw = np.zeros(15, dtype=float)
+    st.session_state.human_filt = np.zeros(15, dtype=float)
+    st.session_state.mapped_target = np.zeros(15, dtype=float)
+
+    st.session_state.calib_min = np.zeros(15, dtype=float)
+    st.session_state.calib_max = np.full(15, 120.0, dtype=float)
+
+    st.session_state.hist_t = deque(maxlen=360)
+    st.session_state.hist_human_avg = deque(maxlen=360)
+    st.session_state.hist_robot_avg = deque(maxlen=360)
+    st.session_state.hist_vel = deque(maxlen=360)
+    st.session_state.hist_latency = deque(maxlen=360)
+
+    st.session_state.last_data = None
+    st.session_state.last_human_pts = None
+
+    st.session_state.auto_start_pending = True
+    st.session_state.selected_finger = "Index"
+    st.session_state.calib_message = ""
+
+    st.session_state.cam_reader = None
+    st.session_state.camera_failed = False
+
+    st.session_state.img_smoother = ArrayEMA()
+    st.session_state.last_img_landmark_time = time.time()
+
+
+# ============================================================
+# App control helpers
+# ============================================================
+
+def finalize_video():
+    rec = st.session_state.get("recorder")
+
+    if rec is None:
+        return
+
+    try:
+        rec.release()
+    except Exception:
+        pass
+
+    path = rec.path
+    st.session_state.recorder = None
+
+    if path and os.path.exists(path) and os.path.getsize(path) > 0:
+        st.session_state.video_path = path
+
+        try:
+            with open(path, "rb") as f:
+                st.session_state.video_bytes = f.read()
+            st.session_state.video_ready = True
+        except Exception:
+            st.session_state.video_bytes = None
+            st.session_state.video_ready = False
+    else:
+        st.session_state.video_path = None
+        st.session_state.video_bytes = None
+        st.session_state.video_ready = False
+
+
+def start_demo(duration, record, fps):
+    old_rec = st.session_state.get("recorder")
+
+    if old_rec is not None:
+        try:
+            old_rec.release()
+        except Exception:
+            pass
+        st.session_state.recorder = None
+
+    st.session_state.running = True
+    st.session_state.run_duration = float(duration)
+    st.session_state.record_enabled = bool(record)
+    st.session_state.fps = int(fps)
+
+    st.session_state.run_start_time = time.time()
+    st.session_state.elapsed = 0.0
+    st.session_state.frame_count = 0
+    st.session_state.sim_time = 0.0
+    st.session_state.last_tick = time.time()
+
+    st.session_state.recorder_failed = False
+
+    st.session_state.video_ready = False
+    st.session_state.video_bytes = None
+    st.session_state.video_path = None
+
+    st.session_state.hal.reset()
+
+    st.session_state.robot_actual = np.zeros(15, dtype=float)
+    st.session_state.robot_cmd = np.zeros(15, dtype=float)
+    st.session_state.human_raw = np.zeros(15, dtype=float)
+    st.session_state.human_filt = np.zeros(15, dtype=float)
+    st.session_state.mapped_target = np.zeros(15, dtype=float)
+
+    st.session_state.hist_t.clear()
+    st.session_state.hist_human_avg.clear()
+    st.session_state.hist_robot_avg.clear()
+    st.session_state.hist_vel.clear()
+    st.session_state.hist_latency.clear()
+
+    st.session_state.last_data = None
+    st.session_state.last_human_pts = None
+
+    if "img_smoother" in st.session_state:
+        st.session_state.img_smoother.reset()
+
+    st.session_state.last_img_landmark_time = time.time()
+
+
+def stop_demo(finalize=True):
+    if finalize:
+        finalize_video()
+
+    st.session_state.running = False
+
+
+def set_calibration(min_arr=None, max_arr=None):
+    if min_arr is not None:
+        st.session_state.calib_min = np.asarray(min_arr, dtype=float).copy()
+
+    if max_arr is not None:
+        st.session_state.calib_max = np.asarray(max_arr, dtype=float).copy()
+
+    st.session_state.calib_min = np.nan_to_num(st.session_state.calib_min, nan=0.0)
+    st.session_state.calib_max = np.nan_to_num(st.session_state.calib_max, nan=0.0)
+
+    span = st.session_state.calib_max - st.session_state.calib_min
+    bad = span < 5.0
+
+    if np.any(bad):
+        st.session_state.calib_max[bad] = st.session_state.calib_min[bad] + 20.0
+
+
+def capture_calibration_angles(mode, cfg):
+    if cfg.get("source", "Synthetic demo").startswith("Webcam"):
+        _, pts, _ = get_webcam_pose(cfg)
+
+        if pts is not None:
+            return extract_joint_angles(pts)
+
+    preset = "Open" if mode == "min" else "Fist"
+    pts = synthetic_landmarks(0.0, preset, 0.0)
+
+    return extract_joint_angles(pts)
+
+
+# ============================================================
+# Main simulation step
+# ============================================================
+
+def advance_step(cfg):
+    tick_start = time.perf_counter()
+
+    now = time.time()
+    dt = now - st.session_state.last_tick
+    dt = float(np.clip(dt, 0.005, 0.25))
+    st.session_state.last_tick = now
+
+    st.session_state.sim_time += dt * float(cfg.get("speed", 1.0))
+
+    left_frame, human_pts, source_msg, source_kind = get_current_pose(cfg)
+
+    if human_pts is None:
+        if st.session_state.last_human_pts is not None:
+            human_pts = st.session_state.last_human_pts
+        else:
+            human_pts = synthetic_landmarks(0.0, "Open", 0.0)
+
+    st.session_state.last_human_pts = human_pts
+
+    human_raw = extract_joint_angles(human_pts)
+    human_raw = np.nan_to_num(human_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    st.session_state.human_raw = human_raw
+
+    prev_filt = st.session_state.human_filt.copy()
+
+    human_rate = float(cfg.get("human_rate", 120.0))
+    human_raw_limited = rate_limit(prev_filt, human_raw, human_rate, dt)
+
+    human_filt = low_pass(
+        prev_filt,
+        human_raw_limited,
+        dt,
+        cfg.get("tau", 0.18),
+    )
+
+    deadzone = float(cfg.get("deadzone", 0.35))
+    delta = human_filt - prev_filt
+    small_motion = np.abs(delta) < deadzone
+
+    human_filt = np.where(small_motion, prev_filt, human_filt)
+
+    st.session_state.human_filt = np.nan_to_num(
+        human_filt,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    mapped = map_human_to_robot(
+        st.session_state.human_filt,
+        st.session_state.calib_min,
+        st.session_state.calib_max,
+        ROBOT_MIN,
+        ROBOT_MAX,
+    )
+
+    if str(cfg.get("control_mode", "")).startswith("IK"):
+        mapped = ik_targets_from_landmarks(human_pts, mapped)
+
+    mapped = apply_collision_constraints(mapped, enabled=bool(cfg.get("use_collision", True)))
+    mapped = np.clip(mapped, ROBOT_MIN, ROBOT_MAX)
+
+    cmd = rate_limit(
+        st.session_state.robot_cmd,
+        mapped,
+        cfg.get("max_rate", 120.0),
+        dt,
+    )
+
+    prev_actual = st.session_state.robot_actual.copy()
+
+    actual, estopped, saturation_events = st.session_state.hal.update(
+        cmd,
+        dt,
+        estop=bool(cfg.get("estop", False)),
+        max_rate_override=cfg.get("max_rate", 120.0),
+    )
+
+    st.session_state.robot_cmd = cmd
+    st.session_state.robot_actual = actual
+    st.session_state.mapped_target = mapped
+
+    effective_target = actual if cfg.get("estop", False) else mapped
+
+    error_deg = float(np.sqrt(np.mean((actual - effective_target) ** 2)))
+
+    calib_span = np.maximum(st.session_state.calib_max - st.session_state.calib_min, 1e-3)
+    human_norm = np.clip(
+        (st.session_state.human_filt - st.session_state.calib_min) / calib_span,
+        0.0,
+        1.0,
+    )
+
+    robot_span = np.maximum(ROBOT_MAX - ROBOT_MIN, 1e-3)
+    robot_norm = np.clip((actual - ROBOT_MIN) / robot_span, 0.0, 1.0)
+
+    error_norm = float(np.sqrt(np.mean((human_norm - robot_norm) ** 2)))
+
+    vel = np.abs(actual - prev_actual) / max(dt, 1e-6)
+    mean_vel = float(np.mean(vel))
+
+    robot_pts_unnormalized = build_hand_from_angles(actual)
+    robot_pts = normalize_landmarks(robot_pts_unnormalized)
+
+    frame = make_scene_frame(
+        human_pts,
+        robot_pts,
+        left_frame,
+        info={
+            "source": source_msg,
+            "control_mode": cfg.get("control_mode", ""),
+            "elapsed": time.time() - st.session_state.run_start_time,
+            "duration": cfg.get("duration", st.session_state.run_duration),
+            "fps": cfg.get("fps", st.session_state.fps),
+            "latency": 0.0,
+            "error": error_deg,
+            "message": source_kind,
+            "estop": bool(cfg.get("estop", False)),
+        },
+    )
+
+    if cfg.get("record", False):
+        if st.session_state.recorder is None and not st.session_state.recorder_failed:
+            st.session_state.recorder = VideoRecorder(
+                cfg.get("fps", st.session_state.fps),
+                (COMBINED_W, FRAME_H),
+            )
+
+            if not st.session_state.recorder.ok:
+                st.session_state.recorder_failed = True
+                st.session_state.recorder = None
+
+        if st.session_state.recorder is not None:
+            st.session_state.recorder.write(frame)
+
+    st.session_state.frame_count += 1
+    st.session_state.elapsed = time.time() - st.session_state.run_start_time
+
+    compute_time = time.perf_counter() - tick_start
+    latency_ms = compute_time * 1000.0
+
+    st.session_state.hist_t.append(st.session_state.elapsed)
+    st.session_state.hist_human_avg.append(float(np.mean(st.session_state.human_filt)))
+    st.session_state.hist_robot_avg.append(float(np.mean(actual)))
+    st.session_state.hist_vel.append(mean_vel)
+    st.session_state.hist_latency.append(latency_ms)
+
+    data = {
+        "source": source_msg,
+        "source_kind": source_kind,
+        "frame": frame,
+        "human_raw": st.session_state.human_raw.copy(),
+        "human_filt": st.session_state.human_filt.copy(),
+        "mapped_target": mapped.copy(),
+        "robot_cmd": cmd.copy(),
+        "robot_actual": actual.copy(),
+        "error_deg": error_deg,
+        "error_norm": error_norm,
+        "velocity": mean_vel,
+        "latency": latency_ms,
+        "compute_time": compute_time,
+        "elapsed": st.session_state.elapsed,
+        "duration": cfg.get("duration", st.session_state.run_duration),
+        "fps": cfg.get("fps", st.session_state.fps),
+        "saturation": saturation_events,
+        "estop": bool(cfg.get("estop", False)),
+        "max_rate": float(cfg.get("max_rate", 120.0)),
     }
-}
 
-initClouds();
+    st.session_state.last_data = data
+    return data
 
-function bandFromIntensity(v) {
-    if (v < 3) return 0;
-    if (v < 6) return 1;
-    if (v < 9) return 2;
-    return 3;
-}
 
-function resetCalm() {
-    state.intensity = 0;
-    state.raw = 0;
-    state.band = 0;
-    state.bandCandidate = 0;
-    state.bandCandidateT = state.t;
-    state.crescendoUntil = -1;
-    state.raiseHold = 0;
-    state.flashEvents = [];
-    state.thunderEvents = [];
-    state.drops = [];
-    state.splashes = [];
-    state.trailL = [];
-    state.trailR = [];
-    state.lastFlashInfo = null;
-    state.lastThunderInfo = null;
-}
+# ============================================================
+# Rendering
+# ============================================================
 
-function startCalibration() {
-    resetCalm();
-    state.calibrated = false;
-    state.calibT = 0;
-    state.calibSamples = [];
-}
+def render_status(ph, data):
+    with ph.container():
+        if st.session_state.estop:
+            st.error("EMERGENCY STOP ACTIVE - actuator outputs are disabled.")
 
-function autoControls(t) {
-    const dur = 80;
-    const tt = t % dur;
+        c1, c2, c3, c4, c5 = st.columns(5)
 
-    if (tt < state.calibDur) {
-        return { amp: 0, speed: 0, raise: false };
-    }
+        c1.metric("Source", str(data.get("source", "—"))[:24])
+        c2.metric("Latency", f"{data.get('latency', 0.0):.0f} ms")
+        c3.metric("Angle RMSE", f"{data.get('error_deg', 0.0):.1f}°")
+        c4.metric("Normalized error", f"{data.get('error_norm', 0.0):.2f}")
+        c5.metric(
+            "Time",
+            f"{data.get('elapsed', 0.0):.1f}/{data.get('duration', 0.0):.0f} s",
+        )
 
-    const p = (tt - state.calibDur) / Math.max(1e-6, dur - state.calibDur);
 
-    if (p < 0.16) {
-        const q = smoothstep(0.0, 0.16, p);
-        return {
-            amp: 0.02 + 0.05 * q,
-            speed: 0.25 + 0.25 * q,
-            raise: false
-        };
-    }
+def render_side(ph, data):
+    selected = st.session_state.get("selected_finger", "Index")
 
-    if (p < 0.45) {
-        const q = smoothstep(0.16, 0.45, p);
-        return {
-            amp: 0.07 + 0.17 * q,
-            speed: 0.50 + 0.90 * q,
-            raise: false
-        };
-    }
+    if selected not in FINGERS:
+        selected = "Index"
 
-    if (p < 0.70) {
-        const q = smoothstep(0.45, 0.70, p);
-        return {
-            amp: 0.24 + 0.12 * q,
-            speed: 1.40 + 0.80 * q,
-            raise: false
-        };
-    }
+    f_idx = FINGERS.index(selected)
+    sl = slice(3 * f_idx, 3 * f_idx + 3)
 
-    if (p < 0.76) {
-        return { amp: 0.34, speed: 1.70, raise: true };
-    }
+    refresh = (
+        st.session_state.frame_count % 2 == 0
+        or "side_fig" not in st.session_state
+        or st.session_state.get("side_finger_cache") != selected
+    )
 
-    if (p < 0.88) {
-        return { amp: 0.38, speed: 2.20, raise: true };
-    }
+    if refresh:
+        mapped = np.asarray(data.get("mapped_target", np.zeros(15)), dtype=float)
+        actual = np.asarray(data.get("robot_actual", np.zeros(15)), dtype=float)
 
-    const q = smoothstep(0.88, 1.0, p);
+        fig = go.Figure(
+            data=[
+                go.Bar(name="Human mapped target", x=JOINT_SUFFIX, y=mapped[sl]),
+                go.Bar(name="Robot actual", x=JOINT_SUFFIX, y=actual[sl]),
+            ]
+        )
+
+        fig.update_layout(
+            title=f"{selected} joint angles",
+            height=300,
+            margin=dict(l=10, r=10, t=45, b=10),
+            barmode="group",
+            legend=dict(orientation="h"),
+            yaxis_title="deg",
+        )
+
+        st.session_state.side_fig = fig
+        st.session_state.side_finger_cache = selected
+
+    with ph.container():
+        st.plotly_chart(st.session_state.side_fig, use_container_width=True)
+        st.caption(
+            f"Source: {data.get('source', '—')} | "
+            f"Saturation events: {data.get('saturation', 0)} | "
+            f"E-stop: {'ON' if data.get('estop', False) else 'OFF'}"
+        )
+
+
+def render_angles(ph, data):
+    human_filt = np.asarray(data.get("human_filt", np.zeros(15)), dtype=float)
+    mapped = np.asarray(data.get("mapped_target", np.zeros(15)), dtype=float)
+    actual = np.asarray(data.get("robot_actual", np.zeros(15)), dtype=float)
+
+    span = np.maximum(st.session_state.calib_max - st.session_state.calib_min, 1e-3)
+
+    calibrated_pct = 100.0 * np.clip(
+        (human_filt - st.session_state.calib_min) / span,
+        0.0,
+        1.0,
+    )
+
+    df = pd.DataFrame(
+        {
+            "Human°": human_filt,
+            "Calibrated %": calibrated_pct,
+            "Robot target°": mapped,
+            "Robot actual°": actual,
+            "Error°": actual - mapped,
+        },
+        index=JOINT_LABELS,
+    ).round(1)
+
+    ph.dataframe(df, use_container_width=True, height=380)
+
+
+def render_trends(ph, force=False):
+    t = list(st.session_state.hist_t)
+
+    if len(t) < 2:
+        ph.info("Collecting real-time data...")
+        return
+
+    refresh = force or st.session_state.frame_count % 5 == 0 or "trend_fig" not in st.session_state
+
+    if refresh:
+        human_avg = list(st.session_state.hist_human_avg)
+        robot_avg = list(st.session_state.hist_robot_avg)
+        vel = list(st.session_state.hist_vel)
+        latency = list(st.session_state.hist_latency)
+
+        fig = make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.08,
+            subplot_titles=(
+                "Average joint position",
+                "Mean absolute velocity",
+                "Processing latency",
+            ),
+        )
+
+        fig.add_trace(
+            go.Scatter(x=t, y=human_avg, name="Human avg", mode="lines"),
+            row=1,
+            col=1,
+        )
+
+        fig.add_trace(
+            go.Scatter(x=t, y=robot_avg, name="Robot avg", mode="lines"),
+            row=1,
+            col=1,
+        )
+
+        fig.add_trace(
+            go.Scatter(x=t, y=vel, name="Velocity", mode="lines"),
+            row=2,
+            col=1,
+        )
+
+        fig.add_trace(
+            go.Scatter(x=t, y=latency, name="Latency", mode="lines"),
+            row=3,
+            col=1,
+        )
+
+        fig.update_yaxes(title_text="deg", row=1, col=1)
+        fig.update_yaxes(title_text="deg/s", row=2, col=1)
+        fig.update_yaxes(title_text="ms", row=3, col=1)
+        fig.update_xaxes(title_text="time s", row=3, col=1)
+
+        fig.update_layout(
+            height=620,
+            margin=dict(l=10, r=10, t=45, b=10),
+            legend=dict(orientation="h"),
+            hovermode="x unified",
+        )
+
+        st.session_state.trend_fig = fig
+
+    ph.plotly_chart(st.session_state.trend_fig, use_container_width=True)
+
+
+def render_hardware(ph, data):
+    df = pd.DataFrame(
+        {
+            "Servo": JOINT_LABELS,
+            "Min°": ROBOT_MIN,
+            "Max°": ROBOT_MAX,
+            "Command°": np.asarray(data.get("robot_cmd", np.zeros(15)), dtype=float),
+            "Actual°": np.asarray(data.get("robot_actual", np.zeros(15)), dtype=float),
+        }
+    ).round(1)
+
+    with ph.container():
+        st.markdown(
+            f"**HAL status** | Enabled: `{not data.get('estop', False)}` | "
+            f"Saturation events: `{data.get('saturation', 0)}` | "
+            f"Velocity limit: `{data.get('max_rate', 0.0):.0f} deg/s`"
+        )
+
+        st.dataframe(df, use_container_width=True, height=400)
+
+
+def render_video(ph):
+    with ph.container():
+        if st.session_state.video_ready and st.session_state.video_bytes is not None:
+            path = st.session_state.video_path or "fingerbot_demo.mp4"
+            fname = os.path.basename(path)
+            mime = "video/mp4" if fname.lower().endswith(".mp4") else "video/x-msvideo"
+
+            try:
+                st.video(st.session_state.video_bytes, format=mime)
+            except Exception:
+                st.video(st.session_state.video_bytes)
+
+            st.download_button(
+                label="Download demo video",
+                data=st.session_state.video_bytes,
+                file_name=fname,
+                mime=mime,
+                use_container_width=True,
+            )
+
+        elif st.session_state.running and st.session_state.record_enabled:
+            st.info(
+                f"Recording live demo... frame {st.session_state.frame_count} / "
+                f"{int(st.session_state.fps * st.session_state.run_duration)}"
+            )
+
+        elif st.session_state.recorder_failed:
+            st.warning("Video encoder unavailable. Install imageio-ffmpeg or use OpenCV codecs.")
+
+        else:
+            st.info("Start the demo with recording enabled to generate a downloadable video.")
+
+
+def make_idle_data():
+    if st.session_state.last_data is not None:
+        return st.session_state.last_data
+
+    pts = synthetic_landmarks(0.8, "Natural", 0.0)
+    human_raw = extract_joint_angles(pts)
+    human_filt = human_raw.copy()
+
+    mapped = map_human_to_robot(
+        human_filt,
+        st.session_state.calib_min,
+        st.session_state.calib_max,
+        ROBOT_MIN,
+        ROBOT_MAX,
+    )
+
+    mapped = apply_collision_constraints(mapped, True)
+
+    robot_actual = np.zeros(15, dtype=float)
+    robot_pts = normalize_landmarks(build_hand_from_angles(robot_actual))
+
+    frame = make_scene_frame(
+        pts,
+        robot_pts,
+        None,
+        info={
+            "source": "Idle",
+            "control_mode": "Ready",
+            "elapsed": 0.0,
+            "duration": 0.0,
+            "fps": 0.0,
+            "latency": 0.0,
+            "error": 0.0,
+            "message": "Press Start / Restart Demo",
+            "estop": st.session_state.estop,
+        },
+    )
+
     return {
-        amp: 0.34 - 0.30 * q,
-        speed: 2.00 - 1.60 * q,
-        raise: q < 0.15
-    };
+        "source": "Idle",
+        "source_kind": "idle",
+        "frame": frame,
+        "human_raw": human_raw,
+        "human_filt": human_filt,
+        "mapped_target": mapped,
+        "robot_cmd": mapped,
+        "robot_actual": robot_actual,
+        "error_deg": 0.0,
+        "error_norm": 0.0,
+        "velocity": 0.0,
+        "latency": 0.0,
+        "compute_time": 0.0,
+        "elapsed": 0.0,
+        "duration": 0.0,
+        "fps": 0.0,
+        "saturation": 0,
+        "estop": st.session_state.estop,
+        "max_rate": 0.0,
+    }
+
+
+# ============================================================
+# Sidebar
+# ============================================================
+
+st.sidebar.title("FingerBot Control")
+
+source = st.sidebar.selectbox(
+    "Input source",
+    ["Synthetic demo", "Webcam"],
+    index=0,
+)
+
+if source == "Webcam" and not MP_AVAILABLE:
+    st.sidebar.warning("MediaPipe is not available. Webcam mode will fall back to synthetic demo.")
+
+preset = st.sidebar.selectbox(
+    "Motion preset",
+    ["Natural", "Grasp", "Point", "Pinch", "Wave", "Open", "Fist"],
+    index=0,
+)
+
+speed = st.sidebar.slider("Motion speed", 0.2, 3.0, 1.0, 0.05)
+noise = st.sidebar.slider("Sensor noise", 0.0, 1.0, 0.10, 0.01)
+
+st.sidebar.markdown("### Run / Record")
+
+fps = st.sidebar.select_slider(
+    "Frame rate",
+    options=[8, 10, 12, 15, 20],
+    value=10,
+)
+
+duration = st.sidebar.slider("Duration seconds", 1, 80, 20)
+record = st.sidebar.checkbox("Record demo video", True)
+
+start_btn = st.sidebar.button("Start / Restart Demo")
+stop_btn = st.sidebar.button("Stop & Finalize Video")
+
+if st.sidebar.button("Reset camera"):
+    stop_camera_reader()
+
+st.sidebar.markdown("### Control")
+
+control_mode = st.sidebar.radio(
+    "Control mode",
+    ["Direct joint mapping", "IK fingertip tracking"],
+    horizontal=True,
+)
+
+camera_tau = st.sidebar.slider(
+    "Camera landmark smoothing",
+    0.02,
+    0.60,
+    0.18,
+    0.01,
+)
+
+tau = st.sidebar.slider("Low-pass time constant s", 0.0, 0.40, 0.18, 0.01)
+
+human_rate = st.sidebar.slider(
+    "Human angle rate limit deg/s",
+    30,
+    300,
+    120,
+    5,
+)
+
+max_rate = st.sidebar.slider("Velocity limit deg/s", 30, 500, 120, 5)
+
+deadzone = st.sidebar.slider(
+    "Micro-shake deadzone deg",
+    0.0,
+    2.0,
+    0.35,
+    0.05,
+)
+
+use_collision = st.sidebar.checkbox("Collision constraints", True)
+
+estop = st.sidebar.checkbox(
+    "EMERGENCY STOP",
+    value=st.session_state.estop,
+)
+
+st.session_state.estop = estop
+
+selected_finger = st.sidebar.selectbox("Detail finger", FINGERS, index=1)
+st.session_state.selected_finger = selected_finger
+
+
+# ============================================================
+# Actions
+# ============================================================
+
+if start_btn:
+    st.session_state.auto_start_pending = False
+
+    if st.session_state.estop:
+        st.sidebar.warning("Disengage EMERGENCY STOP before starting.")
+    else:
+        start_demo(duration, record, fps)
+
+if stop_btn:
+    stop_demo(True)
+
+
+current_cfg = {
+    "source": source,
+    "preset": preset,
+    "speed": speed,
+    "noise": noise,
+    "control_mode": control_mode,
+    "tau": tau,
+    "max_rate": max_rate,
+    "use_collision": use_collision,
+    "estop": st.session_state.estop,
+    "fps": int(fps),
+    "record": bool(record),
+    "duration": float(duration),
+    "camera_tau": camera_tau,
+    "human_rate": human_rate,
+    "deadzone": deadzone,
 }
 
-function targetPose(t) {
-    let amp = 0;
-    let speed = 0;
-    let raise = false;
 
-    if (state.auto) {
-        const c = autoControls(t);
-        amp = c.amp;
-        speed = c.speed;
-        raise = c.raise;
-    } else {
-        amp = state.manualAmp * 0.38;
-        speed = state.manualSpeed;
-        raise = state.manualRaise;
-    }
+# ============================================================
+# Auto start
+# ============================================================
 
-    if (t < state.crescendoUntil) {
-        amp = Math.max(amp, 0.38);
-        speed = Math.max(speed, 2.2);
-        raise = true;
-    }
+if st.session_state.auto_start_pending and not st.session_state.running:
+    st.session_state.auto_start_pending = False
+    start_demo(duration=15, record=True, fps=10)
 
-    const cx = W * 0.5 + Math.sin(t * 0.7) * 14;
-    const shoulderY = H * 0.52 + Math.sin(t * 1.2) * 4;
 
-    const ls = { x: cx - W * 0.085, y: shoulderY };
-    const rs = { x: cx + W * 0.085, y: shoulderY };
-    const lh = { x: cx - W * 0.095, y: H * 0.88 };
-    const rh = { x: cx + W * 0.095, y: H * 0.88 };
-    const nose = { x: cx, y: shoulderY - H * 0.12 };
+# ============================================================
+# Layout
+# ============================================================
 
-    let lw, rw, le, re;
+st.title("Continuous Finger-Motion Control for Robotic Hand")
 
-    if (raise) {
-        const lift = H * (0.30 + amp * 0.22);
+st.caption(
+    "Webcam/synthetic hand capture → 3D landmarks → continuous joint angles → normalization → "
+    "interpolation → filtering/velocity limits → IK/constraints → virtual servo HAL."
+)
 
-        lw = {
-            x: cx - W * 0.155 + Math.sin(t * 7.3) * 12,
-            y: shoulderY - lift + Math.sin(t * 9.1) * 8
-        };
+status_ph = st.empty()
 
-        rw = {
-            x: cx + W * 0.155 + Math.cos(t * 6.7) * 12,
-            y: shoulderY - lift + Math.cos(t * 8.3) * 8
-        };
+view_col, side_col = st.columns([1.7, 1.0], gap="small")
+view_ph = view_col.empty()
+side_ph = side_col.empty()
 
-        le = { x: cx - W * 0.135, y: shoulderY - lift * 0.45 };
-        re = { x: cx + W * 0.135, y: shoulderY - lift * 0.45 };
-    } else {
-        const base = shoulderY + H * 0.205;
-        const phase = t * Math.max(0.05, speed) * Math.PI * 2;
+tab_live, tab_trends, tab_calib, tab_hw, tab_video = st.tabs(
+    ["Live Angles", "Trends", "Calibration", "Hardware / Safety", "Demo Video"]
+)
 
-        const liftL = H * amp * (0.5 + 0.5 * Math.sin(phase));
-        const liftR = H * amp * (0.5 + 0.5 * Math.sin(phase + 0.65));
+angle_ph = tab_live.empty()
+trend_ph = tab_trends.empty()
+hardware_ph = tab_hw.empty()
+video_ph = tab_video.empty()
 
-        lw = {
-            x: cx - W * 0.170 - Math.sin(phase * 0.82) * 42,
-            y: base - liftL
-        };
 
-        rw = {
-            x: cx + W * 0.170 + Math.cos(phase * 0.74) * 42,
-            y: base - liftR
-        };
+# ============================================================
+# Calibration tab
+# ============================================================
 
-        le = {
-            x: lerp(ls.x, lw.x, 0.52) - 20,
-            y: lerp(ls.y, lw.y, 0.52) + 16
-        };
+with tab_calib:
+    st.markdown(
+        """
+        Calibrate the human input range:
 
-        re = {
-            x: lerp(rs.x, rw.x, 0.52) + 20,
-            y: lerp(rs.y, rw.y, 0.52) + 16
-        };
-    }
+        - **Capture Min**: open hand / minimal flexion.
+        - **Capture Max**: fist / maximum flexion.
+        - In synthetic mode, these buttons automatically use generated Open/Fist poses.
+        - In webcam mode, show your hand and click capture.
+        """
+    )
 
-    return { cx, shoulderY, ls, rs, le, re, lw, rw, lh, rh, nose };
-}
+    c1, c2, c3 = st.columns(3)
 
-let currentPose = targetPose(0);
+    cal_min_btn = c1.button("Capture Min (Open)")
+    cal_max_btn = c2.button("Capture Max (Fist)")
+    cal_reset_btn = c3.button("Reset Calibration")
 
-function updatePose(dt) {
-    const target = targetPose(state.t);
-    const k = 1 - Math.exp(-dt * 14);
+    cal_auto_btn = st.button("Auto-calibrate synthetic Open/Fist")
+    calib_msg_ph = st.empty()
 
-    const keys = ['ls', 'rs', 'le', 're', 'lw', 'rw', 'lh', 'rh', 'nose'];
+    if cal_min_btn:
+        angles = capture_calibration_angles("min", current_cfg)
+        set_calibration(min_arr=angles)
+        st.session_state.calib_message = "Minimum calibration captured."
 
-    for (const key of keys) {
-        currentPose[key].x = lerp(currentPose[key].x, target[key].x, k);
-        currentPose[key].y = lerp(currentPose[key].y, target[key].y, k);
-    }
+    if cal_max_btn:
+        angles = capture_calibration_angles("max", current_cfg)
+        set_calibration(max_arr=angles)
+        st.session_state.calib_message = "Maximum calibration captured."
 
-    currentPose.cx = lerp(currentPose.cx, target.cx, k);
-    currentPose.shoulderY = (currentPose.ls.y + currentPose.rs.y) / 2;
+    if cal_reset_btn:
+        st.session_state.calib_min = np.zeros(15, dtype=float)
+        st.session_state.calib_max = np.full(15, 120.0, dtype=float)
+        st.session_state.calib_message = "Calibration reset to defaults."
 
-    state.trailL.push({ x: currentPose.lw.x, y: currentPose.lw.y, t: state.t });
-    state.trailR.push({ x: currentPose.rw.x, y: currentPose.rw.y, t: state.t });
+    if cal_auto_btn:
+        min_angles = capture_calibration_angles("min", {"source": "Synthetic demo"})
+        max_angles = capture_calibration_angles("max", {"source": "Synthetic demo"})
+        set_calibration(min_arr=min_angles, max_arr=max_angles)
+        st.session_state.calib_message = "Automatic synthetic calibration complete."
 
-    while (state.trailL.length && state.t - state.trailL[0].t > 0.55) state.trailL.shift();
-    while (state.trailR.length && state.t - state.trailR[0].t > 0.55) state.trailR.shift();
-}
+    if st.session_state.calib_message:
+        calib_msg_ph.info(st.session_state.calib_message)
 
-function updateCalibration(dt) {
-    if (state.calibrated) return;
-
-    state.calibT += dt;
-
-    const wrY = (currentPose.lw.y + currentPose.rw.y) / 2;
-    const rel = wrY - currentPose.shoulderY;
-    state.calibSamples.push(rel);
-
-    if (state.calibSamples.length > 220) state.calibSamples.shift();
-
-    if (state.calibT >= state.calibDur) {
-        state.calibrated = true;
-
-        if (state.calibSamples.length) {
-            const avg = state.calibSamples.reduce((a, b) => a + b, 0) / state.calibSamples.length;
-            if (Number.isFinite(avg)) state.neutralWristRelPx = avg;
+    cal_df = pd.DataFrame(
+        {
+            "Joint": JOINT_LABELS,
+            "Calib Min°": st.session_state.calib_min,
+            "Calib Max°": st.session_state.calib_max,
+            "Robot Min°": ROBOT_MIN,
+            "Robot Max°": ROBOT_MAX,
         }
-    }
-}
+    ).round(1)
 
-function computePointerRaw() {
-    while (state.pointerHistory.length && state.t - state.pointerHistory[0].t > 1.0) {
-        state.pointerHistory.shift();
-    }
+    st.dataframe(cal_df, use_container_width=True, height=380)
 
-    if (state.pointerHistory.length < 5) return 0;
 
-    let minY = Infinity;
-    let maxY = -Infinity;
-    let dist = 0;
+# ============================================================
+# Live loop
+# ============================================================
 
-    for (let i = 0; i < state.pointerHistory.length; i++) {
-        const p = state.pointerHistory[i];
-        minY = Math.min(minY, p.y);
-        maxY = Math.max(maxY, p.y);
-
-        if (i > 0) {
-            const q = state.pointerHistory[i - 1];
-            dist += Math.hypot(p.x - q.x, p.y - q.y);
-        }
-    }
-
-    const first = state.pointerHistory[0];
-    const last = state.pointerHistory[state.pointerHistory.length - 1];
-    const dt = last.t - first.t;
-
-    if (dt <= 0) return 0;
-
-    const speed = dist / dt;
-    const rangeY = maxY - minY;
-
-    const rangeScore = clamp(rangeY / (H * 0.45));
-    const speedScore = clamp(speed / (W * 1.8));
-
-    return 10 * (0.55 * rangeScore + 0.45 * speedScore);
-}
-
-function updateIntensity(dt) {
-    const wrX = (currentPose.lw.x + currentPose.rw.x) / 2;
-    const wrY = (currentPose.lw.y + currentPose.rw.y) / 2;
-    const rel = wrY - currentPose.shoulderY;
-
-    state.wristHistory.push({ t: state.t, rel, x: wrX, y: wrY });
-
-    while (state.wristHistory.length && state.t - state.wristHistory[0].t > 1.0) {
-        state.wristHistory.shift();
+if st.session_state.running:
+    run_cfg = {
+        "source": source,
+        "preset": preset,
+        "speed": speed,
+        "noise": noise,
+        "control_mode": control_mode,
+        "tau": tau,
+        "max_rate": max_rate,
+        "use_collision": use_collision,
+        "estop": st.session_state.estop,
+        "fps": int(st.session_state.fps),
+        "record": bool(st.session_state.record_enabled),
+        "duration": float(st.session_state.run_duration),
+        "camera_tau": camera_tau,
+        "human_rate": human_rate,
+        "deadzone": deadzone,
     }
 
-    let poseRaw = 0;
-
-    if (state.calibrated && state.wristHistory.length > 4) {
-        let minLift = Infinity;
-        let maxLift = -Infinity;
-        let dist = 0;
-
-        for (let i = 0; i < state.wristHistory.length; i++) {
-            const p = state.wristHistory[i];
-            const lift = state.neutralWristRelPx - p.rel;
-            minLift = Math.min(minLift, lift);
-            maxLift = Math.max(maxLift, lift);
-
-            if (i > 0) {
-                const q = state.wristHistory[i - 1];
-                dist += Math.hypot(p.x - q.x, p.y - q.y);
-            }
-        }
-
-        const first = state.wristHistory[0];
-        const last = state.wristHistory[state.wristHistory.length - 1];
-        const windowDt = last.t - first.t;
-
-        const verticalRange = Math.max(0, maxLift - minLift);
-        const speed = windowDt > 0 ? dist / windowDt : 0;
-
-        const rangeScore = clamp(verticalRange / (H * 0.34));
-        const speedScore = clamp(speed / (H * 2.6));
-
-        poseRaw = 10 * (0.58 * rangeScore + 0.42 * speedScore);
-    }
-
-    if (!state.calibrated) poseRaw = 0;
-
-    if (state.t < state.crescendoUntil) poseRaw = 10;
-
-    const pointerRaw = state.auto ? 0 : computePointerRaw();
-    const raw = Math.max(poseRaw, pointerRaw);
-
-    state.raw = raw;
-
-    const tau = 0.22;
-    let next = state.intensity + (raw - state.intensity) * (1 - Math.exp(-dt / tau));
-
-    if (state.t < state.crescendoUntil) next = 10;
-
-    state.intensity = clamp(next, 0, 10);
-
-    const b = bandFromIntensity(state.intensity);
-
-    if (b !== state.bandCandidate) {
-        state.bandCandidate = b;
-        state.bandCandidateT = state.t;
-    }
-
-    if (state.t - state.bandCandidateT > 0.25) {
-        state.band = state.bandCandidate;
-    }
-}
-
-function updateCrescendoDetection(dt) {
-    const sh = currentPose.shoulderY;
-    const high =
-        currentPose.lw.y < sh - H * 0.09 &&
-        currentPose.rw.y < sh - H * 0.09;
-
-    if (high) {
-        state.raiseHold += dt;
-    } else {
-        state.raiseHold = 0;
-    }
-
-    if (
-        state.raiseHold > 0.85 &&
-        state.t > state.crescendoUntil + 0.5 &&
-        state.t - state.lastCrescendo > 6.0
-    ) {
-        triggerCrescendo(false);
-    }
-}
-
-function triggerCrescendo(force = false) {
-    if (!force && state.t - state.lastCrescendo < 6.0) return;
-
-    state.crescendoUntil = state.t + 3.0;
-    state.lastCrescendo = state.t;
-
-    const distances = [150, 320, 560];
-
-    distances.forEach((d, i) => {
-        state.flashEvents.push({
-            time: state.t + 0.05 + i * 0.95,
-            distance: d
-        });
-    });
-}
-
-function makeBolt() {
-    const segs = [];
-    const pts = [];
-
-    let x = W * (0.2 + Math.random() * 0.6);
-    let y = 0;
-
-    pts.push([x, y]);
-
-    while (y < H * 0.68) {
-        x += (Math.random() - 0.5) * 95;
-        y += 25 + Math.random() * 58;
-        pts.push([x, y]);
-    }
-
-    for (let i = 1; i < pts.length; i++) {
-        segs.push([
-            pts[i - 1][0],
-            pts[i - 1][1],
-            pts[i][0],
-            pts[i][1]
-        ]);
-    }
-
-    const branches = 2 + Math.floor(Math.random() * 3);
-
-    for (let b = 0; b < branches; b++) {
-        const idx = 1 + Math.floor(Math.random() * Math.max(1, pts.length - 2));
-        let [bx, by] = pts[idx];
-
-        for (let j = 0; j < 4; j++) {
-            const nx = bx + (Math.random() - 0.5) * 90;
-            const ny = by + 20 + Math.random() * 50;
-
-            segs.push([bx, by, nx, ny]);
-
-            bx = nx;
-            by = ny;
-        }
-    }
-
-    return segs;
-}
-
-function startFlash(distance) {
-    state.flash.start = state.t;
-    state.flash.distance = distance;
-    state.flash.bolt = makeBolt();
-    state.lastFlashInfo = { distance, t: state.t };
-
-    state.thunderEvents.push({
-        time: state.t + distance / 343.0,
-        distance
-    });
-}
-
-function updateStormEvents(dt) {
-    if (state.intensity >= 8.7 && state.t >= state.crescendoUntil) {
-        const p = clamp((state.intensity - 8.7) / 1.3) * 1.2 + 0.12;
-
-        if (Math.random() < p * dt) {
-            state.flashEvents.push({
-                time: state.t + Math.random() * 0.05,
-                distance: 110 + Math.random() * 540
-            });
-        }
-    }
-
-    state.flashEvents = state.flashEvents.filter(e => {
-        if (e.time <= state.t) {
-            startFlash(e.distance);
-            return false;
-        }
-        return true;
-    });
-
-    state.thunderEvents = state.thunderEvents.filter(e => {
-        if (e.time <= state.t) {
-            if (state.soundOn) playThunder(e.distance);
-            state.lastThunderInfo = { distance: e.distance, t: state.t };
-            return false;
-        }
-        return true;
-    });
-}
-
-function updateClouds(dt) {
-    for (const c of state.clouds) {
-        c.x += (c.speed + state.wind * 0.30) * dt;
-
-        const w = c.sprite.width * c.scale;
-
-        if (c.x - w / 2 > W) {
-            c.x = -w / 2;
-            c.y = 18 + Math.random() * 180;
-        }
-    }
-}
-
-function addSplash(x, y) {
-    if (state.splashes.length > 90) state.splashes.shift();
-
-    state.splashes.push({
-        x,
-        y,
-        r: 1,
-        t: 0,
-        life: 0.28
-    });
-}
-
-function updateRain(dt) {
-    const target = state.intensity < 3
-        ? 0
-        : Math.floor(70 + (state.intensity - 3) * 70);
-
-    while (state.drops.length < target) {
-        state.drops.push({
-            x: Math.random() * W,
-            y: -80 - Math.random() * 80,
-            len: 8 + Math.random() * 18,
-            vy: 320 + Math.random() * 220,
-            drift: -20 + Math.random() * 40
-        });
-    }
-
-    if (state.drops.length > target) {
-        state.drops.length = target;
-    }
-
-    const windTarget = state.intensity < 6
-        ? 0
-        : 25 + (state.intensity - 6) * 38;
-
-    state.wind = lerp(state.wind, windTarget, 1 - Math.exp(-dt * 2.0));
-
-    const next = [];
-
-    for (const d of state.drops) {
-        d.vy = lerp(d.vy, 340 + state.intensity * 42, 1 - Math.exp(-dt * 1.2));
-        d.x += (state.wind + d.drift) * dt;
-        d.y += d.vy * dt;
-
-        if (d.y < H + 30) {
-            next.push(d);
-        } else {
-            if (state.intensity > 5 && Math.random() < 0.25) {
-                addSplash(d.x, H - 2);
-            }
-
-            if (next.length < target) {
-                d.x = Math.random() * W;
-                d.y = -80 - Math.random() * 80;
-                d.len = 8 + Math.random() * 18;
-                d.drift = -20 + Math.random() * 40;
-                next.push(d);
-            }
-        }
-    }
-
-    state.drops = next;
-
-    const nextSplashes = [];
-
-    for (const s of state.splashes) {
-        s.t += dt;
-        s.r += 90 * dt;
-
-        if (s.t < s.life) nextSplashes.push(s);
-    }
-
-    state.splashes = nextSplashes;
-}
-
-function initAudio() {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    if (!AC) return;
-
-    audioCtx = new AC();
-
-    const len = Math.floor(audioCtx.sampleRate * 2);
-    noiseBuffer = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
-
-    const data = noiseBuffer.getChannelData(0);
-
-    let last = 0;
-
-    for (let i = 0; i < len; i++) {
-        const white = Math.random() * 2 - 1;
-        last = (last + 0.02 * white) / 1.02;
-        data[i] = last * 3.5;
-    }
-
-    masterGain = audioCtx.createGain();
-    masterGain.gain.value = 0.75;
-    masterGain.connect(audioCtx.destination);
-}
-
-function playThunder(distance) {
-    if (!audioCtx || !noiseBuffer || !state.soundOn) return;
-
-    const src = audioCtx.createBufferSource();
-    src.buffer = noiseBuffer;
-    src.loop = true;
-
-    const filter = audioCtx.createBiquadFilter();
-    filter.type = 'lowpass';
-
-    const gain = audioCtx.createGain();
-
-    const now = audioCtx.currentTime;
-    const near = clamp(1 - distance / 800, 0.15, 1);
-    const dur = 1.2 + distance / 400;
-
-    filter.frequency.setValueAtTime(180 + 700 * near, now);
-    filter.frequency.exponentialRampToValueAtTime(45, now + dur);
-
-    gain.gain.setValueAtTime(0.0001, now);
-    gain.gain.exponentialRampToValueAtTime(0.65 + 0.3 * near, now + 0.04);
-    gain.gain.exponentialRampToValueAtTime(0.0001, now + dur);
-
-    src.connect(filter);
-    filter.connect(gain);
-    gain.connect(masterGain);
-
-    src.start(now);
-    src.stop(now + dur + 0.1);
-}
-
-function drawBackground() {
-    const severity = state.intensity / 10;
-
-    const top = lerpColor([232, 218, 202], [18, 15, 26], severity);
-    const bottom = lerpColor([246, 241, 236], [62, 55, 66], severity);
-
-    const grad = ctx.createLinearGradient(0, 0, 0, H);
-    grad.addColorStop(0, rgba(top));
-    grad.addColorStop(1, rgba(bottom));
-
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, W, H);
-}
-
-function drawClouds() {
-    const severity = state.intensity / 10;
-    const cloudAlpha = lerp(0.55, 0.22, severity);
-
-    for (const c of state.clouds) {
-        const w = c.sprite.width * c.scale;
-        const h = c.sprite.height * c.scale;
-
-        ctx.globalAlpha = c.alpha * cloudAlpha;
-        ctx.drawImage(c.sprite, c.x - w / 2, c.y - h / 2, w, h);
-    }
-
-    ctx.globalAlpha = 1;
-}
-
-function drawRain() {
-    if (state.band < 1 || !state.drops.length) return;
-
-    const slant = state.band >= 2 ? state.wind * 0.045 : 0;
-
-    ctx.strokeStyle = 'rgba(215,228,255,0.48)';
-    ctx.lineWidth = 1.3;
-    ctx.beginPath();
-
-    for (const d of state.drops) {
-        const dx = slant * (d.len / 18);
-        ctx.moveTo(d.x, d.y);
-        ctx.lineTo(d.x + dx, d.y + d.len);
-    }
-
-    ctx.stroke();
-
-    if (state.splashes.length) {
-        ctx.lineWidth = 1.5;
-
-        for (const s of state.splashes) {
-            const a = 0.35 * clamp(1 - s.t / s.life);
-            ctx.strokeStyle = `rgba(230,240,255,${a})`;
-
-            ctx.beginPath();
-            ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
-            ctx.stroke();
-        }
-    }
-}
-
-function drawTrail() {
-    const trails = [state.trailL, state.trailR];
-
-    ctx.lineCap = 'round';
-
-    for (const trail of trails) {
-        for (let i = 1; i < trail.length; i++) {
-            const age = state.t - trail[i].t;
-            const alpha = clamp(1 - age / 0.55) * 0.28;
-
-            ctx.strokeStyle = `rgba(56,255,216,${alpha})`;
-            ctx.lineWidth = 4;
-
-            ctx.beginPath();
-            ctx.moveTo(trail[i - 1].x, trail[i - 1].y);
-            ctx.lineTo(trail[i].x, trail[i].y);
-            ctx.stroke();
-        }
-    }
-}
-
-function drawPose() {
-    const p = currentPose;
-
-    const connections = [
-        ['ls', 'le'],
-        ['le', 'lw'],
-        ['rs', 're'],
-        ['re', 'rw'],
-        ['ls', 'rs'],
-        ['ls', 'lh'],
-        ['rs', 'rh'],
-        ['lh', 'rh'],
-        ['nose', 'ls'],
-        ['nose', 'rs']
-    ];
-
-    ctx.lineWidth = 4;
-    ctx.strokeStyle = 'rgba(0,255,190,0.82)';
-    ctx.beginPath();
-
-    for (const [a, b] of connections) {
-        ctx.moveTo(p[a].x, p[a].y);
-        ctx.lineTo(p[b].x, p[b].y);
-    }
-
-    ctx.stroke();
-
-    const points = ['nose', 'ls', 'rs', 'le', 're', 'lw', 'rw', 'lh', 'rh'];
-
-    for (const key of points) {
-        ctx.beginPath();
-        ctx.arc(p[key].x, p[key].y, key === 'lw' || key === 'rw' ? 6 : 4, 0, Math.PI * 2);
-        ctx.fillStyle = key === 'lw' || key === 'rw'
-            ? 'rgba(255,214,102,0.95)'
-            : 'rgba(0,200,255,0.92)';
-        ctx.fill();
-    }
-}
-
-function drawLightning() {
-    const activeT = state.t - state.flash.start;
-
-    if (activeT > state.flash.duration) return;
-
-    const progress = clamp(activeT / state.flash.duration);
-
-    if (progress < 0.7 && state.flash.bolt) {
-        ctx.save();
-        ctx.globalCompositeOperation = 'lighter';
-        ctx.shadowColor = 'rgba(170,225,255,0.95)';
-        ctx.shadowBlur = 18;
-        ctx.strokeStyle = 'rgba(245,250,255,0.96)';
-        ctx.lineWidth = 3;
-
-        ctx.beginPath();
-
-        for (const s of state.flash.bolt) {
-            ctx.moveTo(s[0], s[1]);
-            ctx.lineTo(s[2], s[3]);
-        }
-
-        ctx.stroke();
-        ctx.restore();
-    }
-
-    const alpha = 0.9 * (1 - progress);
-
-    if (alpha > 0.01) {
-        ctx.fillStyle = `rgba(255,255,255,${alpha})`;
-        ctx.fillRect(0, 0, W, H);
-    }
-}
-
-function drawHUD() {
-    ctx.save();
-
-    ctx.fillStyle = 'rgba(4,10,22,0.52)';
-    roundRect(12, 12, 390, 104, 16);
-    ctx.fill();
-
-    ctx.fillStyle = '#ffd166';
-    ctx.font = '700 24px Arial';
-    ctx.fillText('Advanced Storm Conductor', 24, 43);
-
-    ctx.font = '14px Arial';
-    ctx.fillStyle = '#e5e7eb';
-    ctx.fillText(`Mode: ${state.auto ? 'Auto demo' : 'Manual conductor'}`, 24, 66);
-    ctx.fillText(`Band: ${BAND_NAMES[state.band]}`, 24, 84);
-
-    ctx.fillStyle = state.calibrated ? '#bef264' : '#7dd3fc';
-    ctx.fillText(
-        state.calibrated
-            ? 'Calibrated'
-            : `Calibrating ${Math.max(0, state.calibDur - state.calibT).toFixed(1)}s`,
-        24,
-        102
-    );
-
-    const meterX = W - 62;
-    const meterY = 44;
-    const meterW = 28;
-    const meterH = H - 132;
-
-    ctx.fillStyle = 'rgba(3,8,17,0.56)';
-    roundRect(meterX - 8, meterY - 26, meterW + 16, meterH + 64, 16);
-    ctx.fill();
-
-    ctx.fillStyle = 'rgba(255,255,255,0.10)';
-    roundRect(meterX, meterY, meterW, meterH, 10);
-    ctx.fill();
-
-    const fillH = meterH * clamp(state.intensity / 10);
-    const grad = ctx.createLinearGradient(0, meterY + meterH, 0, meterY);
-    grad.addColorStop(0, '#22c55e');
-    grad.addColorStop(0.45, '#eab308');
-    grad.addColorStop(0.75, '#f97316');
-    grad.addColorStop(1, '#ef4444');
-
-    if (fillH > 1) {
-        ctx.fillStyle = grad;
-        roundRect(meterX, meterY + meterH - fillH, meterW, fillH, 10);
-        ctx.fill();
-    }
-
-    ctx.fillStyle = '#f8fafc';
-    ctx.font = '700 18px Arial';
-    ctx.fillText(state.intensity.toFixed(1), meterX - 2, meterY - 34);
-
-    ctx.font = '12px Arial';
-    ctx.fillStyle = '#cbd5e1';
-    ctx.fillText('0-10', meterX + 2, meterY + meterH + 22);
-
-    if (state.lastFlashInfo && state.t - state.lastFlashInfo.t < 4.0) {
-        const d = state.lastFlashInfo.distance;
-        const delay = d / 343;
-
-        ctx.fillStyle = 'rgba(4,10,22,0.52)';
-        roundRect(12, H - 54, 430, 36, 12);
-        ctx.fill();
-
-        ctx.fillStyle = '#bae6fd';
-        ctx.font = '13px Arial';
-        ctx.fillText(
-            `Lightning ${Math.round(d)} m -> thunder in ${delay.toFixed(2)}s`,
-            24,
-            H - 31
-        );
-    }
-
-    if (state.t < state.crescendoUntil) {
-        ctx.font = '900 44px Arial';
-        ctx.fillStyle = 'rgba(255,80,80,0.92)';
-        ctx.shadowColor = 'rgba(255,80,80,0.55)';
-        ctx.shadowBlur = 18;
-        ctx.textAlign = 'center';
-        ctx.fillText('CRESCENDO', W / 2, H * 0.17);
-        ctx.shadowBlur = 0;
-        ctx.textAlign = 'left';
-    }
-
-    ctx.restore();
-}
-
-function drawCalibration() {
-    if (state.calibrated) return;
-
-    ctx.fillStyle = 'rgba(2,6,12,0.52)';
-    ctx.fillRect(0, 0, W, H);
-
-    ctx.textAlign = 'center';
-
-    ctx.fillStyle = '#ffffff';
-    ctx.font = '700 32px Arial';
-    ctx.fillText('Calibration: stand still / wait', W / 2, H * 0.44);
-
-    ctx.fillStyle = '#7dd3fc';
-    ctx.font = '900 52px Arial';
-    ctx.fillText(
-        Math.max(0, state.calibDur - state.calibT).toFixed(1),
-        W / 2,
-        H * 0.58
-    );
-
-    ctx.textAlign = 'left';
-}
-
-function drawRecording() {
-    if (!state.recording) return;
-
-    ctx.save();
-
-    ctx.fillStyle = 'rgba(239,68,68,0.95)';
-    ctx.beginPath();
-    ctx.arc(W - 24, 24, 8, 0, Math.PI * 2);
-    ctx.fill();
-
-    ctx.fillStyle = '#fecaca';
-    ctx.font = '700 14px Arial';
-    ctx.textAlign = 'right';
-    ctx.fillText('REC', W - 40, 29);
-
-    ctx.restore();
-}
-
-function update(dt) {
-    state.t += dt;
-
-    updatePose(dt);
-    updateCalibration(dt);
-    updateIntensity(dt);
-    updateCrescendoDetection(dt);
-    updateStormEvents(dt);
-    updateClouds(dt);
-    updateRain(dt);
-
-    if (
-        state.recording &&
-        state.t >= state.recordStopAt &&
-        recorder &&
-        recorder.state === 'recording'
-    ) {
-        recorder.stop();
-    }
-}
-
-function render() {
-    drawBackground();
-    drawClouds();
-    drawRain();
-    drawTrail();
-    drawPose();
-    drawLightning();
-    drawHUD();
-    drawCalibration();
-    drawRecording();
-}
-
-let lastStatusUpdate = 0;
-
-function updateStatus() {
-    if (state.t - lastStatusUpdate < 0.12) return;
-    lastStatusUpdate = state.t;
-
-    statusEl.textContent =
-        `Intensity ${state.intensity.toFixed(1)}/10 | ` +
-        `${BAND_NAMES[state.band]} | ` +
-        `FPS ${Math.round(state.fps)} | ` +
-        `${state.recording ? 'Recording' : 'Live'}`;
-}
-
-function frame() {
-    const now = performance.now() / 1000;
-    let dt = now - state.last;
-    state.last = now;
-
-    dt = clamp(dt, 0.0001, 0.05);
-
-    state.fps = lerp(state.fps, 1 / dt, 0.05);
-
-    update(dt);
-    render();
-    updateStatus();
-
-    requestAnimationFrame(frame);
-}
-
-requestAnimationFrame(frame);
-
-canvas.addEventListener('pointermove', e => {
-    const rect = canvas.getBoundingClientRect();
-
-    const x = (e.clientX - rect.left) / rect.width * W;
-    const y = (e.clientY - rect.top) / rect.height * H;
-
-    state.pointerHistory.push({ t: state.t, x, y });
-
-    if (state.pointerHistory.length > 140) {
-        state.pointerHistory.shift();
-    }
-});
-
-autoBtn.addEventListener('click', () => {
-    state.auto = !state.auto;
-    autoBtn.textContent = `Auto Demo: ${state.auto ? 'ON' : 'OFF'}`;
-    autoBtn.classList.toggle('active', state.auto);
-});
-
-calibrateBtn.addEventListener('click', () => {
-    startCalibration();
-});
-
-crescendoBtn.addEventListener('click', () => {
-    triggerCrescendo(true);
-});
-
-calmBtn.addEventListener('click', () => {
-    resetCalm();
-});
-
-soundBtn.addEventListener('click', async () => {
-    if (!audioCtx) initAudio();
-
-    if (audioCtx && audioCtx.state === 'suspended') {
-        await audioCtx.resume();
-    }
-
-    state.soundOn = !state.soundOn;
-    soundBtn.textContent = `Sound: ${state.soundOn ? 'ON' : 'OFF'}`;
-    soundBtn.classList.toggle('active', state.soundOn);
-});
-
-ampRange.addEventListener('input', e => {
-    state.manualAmp = parseFloat(e.target.value);
-});
-
-speedRange.addEventListener('input', e => {
-    state.manualSpeed = parseFloat(e.target.value);
-});
-
-raiseCheck.addEventListener('change', e => {
-    state.manualRaise = e.target.checked;
-});
-
-function pickMime() {
-    const candidates = [
-        'video/webm;codecs=vp9',
-        'video/webm;codecs=vp8',
-        'video/webm',
-        'video/mp4'
-    ];
-
-    for (const c of candidates) {
-        if (window.MediaRecorder && MediaRecorder.isTypeSupported(c)) {
-            return c;
-        }
-    }
-
-    return '';
-}
-
-function toggleRecording() {
-    if (state.recording) {
-        if (recorder && recorder.state === 'recording') {
-            recorder.stop();
-        }
-        return;
-    }
-
-    if (!window.MediaRecorder) {
-        statusEl.textContent = 'Recording not supported in this browser.';
-        return;
-    }
-
-    const mime = pickMime();
-
-    if (!mime) {
-        statusEl.textContent = 'No supported video format found.';
-        return;
-    }
-
-    const stream = canvas.captureStream(60);
-
-    state.chunks = [];
-
-    recorder = new MediaRecorder(stream, {
-        mimeType: mime,
-        videoBitsPerSecond: 6_000_000
-    });
-
-    recorder.ondataavailable = e => {
-        if (e.data && e.data.size > 0) {
-            state.chunks.push(e.data);
-        }
-    };
-
-    recorder.onstop = () => {
-        const blob = new Blob(state.chunks, { type: mime });
-        const url = URL.createObjectURL(blob);
-
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `storm-conductor-${recordLength.value}s.webm`;
-
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-
-        setTimeout(() => URL.revokeObjectURL(url), 3000);
-
-        state.recording = false;
-        recordBtn.classList.remove('rec');
-        recordBtn.textContent = 'Record Video';
-    };
-
-    const len = parseInt(recordLength.value, 10);
-
-    state.recording = true;
-    state.recordStopAt = state.t + len;
-
-    recordBtn.classList.add('rec');
-    recordBtn.textContent = `Stop ${len}s`;
-
-    recorder.start(250);
-}
-
-recordBtn.addEventListener('click', toggleRecording);
-
-startCalibration();
-</script>
-</body>
-</html>
-"""
-
-components.html(APP_HTML, height=880, scrolling=False)
+    data = advance_step(run_cfg)
+
+    render_status(status_ph, data)
+    view_ph.image(data["frame"], channels="BGR", use_container_width=True)
+    render_side(side_ph, data)
+    render_angles(angle_ph, data)
+    render_trends(trend_ph, force=False)
+    render_hardware(hardware_ph, data)
+    render_video(video_ph)
+
+    finished = (
+        st.session_state.elapsed >= st.session_state.run_duration
+        or st.session_state.frame_count >= int(st.session_state.fps * st.session_state.run_duration)
+    )
+
+    if finished:
+        stop_demo(True)
+        render_video(video_ph)
+    else:
+        sleep_time = max(0.0, 1.0 / max(st.session_state.fps, 1) - data.get("compute_time", 0.0))
+        time.sleep(sleep_time)
+        rerun_app()
+
+else:
+    data = make_idle_data()
+
+    render_status(status_ph, data)
+
+    if "frame" in data:
+        view_ph.image(data["frame"], channels="BGR", use_container_width=True)
+
+    render_side(side_ph, data)
+    render_angles(angle_ph, data)
+    render_trends(trend_ph, force=True)
+    render_hardware(hardware_ph, data)
+    render_video(video_ph)
